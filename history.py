@@ -1,8 +1,17 @@
-import os
+"""
+Detection history views built on top of the CSV store.
+
+All readers go through database.read_database(), which caches the
+parsed frame and only re-reads the file when it changed on disk.
+"""
+
+import logging
 
 import pandas as pd
 
-from config import DATABASE_FILE
+from database import read_database
+
+logger = logging.getLogger(__name__)
 
 
 # ============================================================
@@ -11,19 +20,7 @@ from config import DATABASE_FILE
 
 def get_history_data():
 
-    if not os.path.exists(DATABASE_FILE):
-
-        return pd.DataFrame()
-
-    try:
-
-        return pd.read_csv(DATABASE_FILE)
-
-    except Exception as error:
-
-        print("Database read error:", error)
-
-        return pd.DataFrame()
+    return read_database()
 
 
 # ============================================================
@@ -38,11 +35,9 @@ def get_history():
 
         return "No History Available"
 
-    history = ""
+    parts = []
 
-    df = df.iloc[::-1]
-
-    for _, row in df.iterrows():
+    for _, row in df.iloc[::-1].iterrows():
 
         plate = row.get(
             "Plate Number",
@@ -74,14 +69,14 @@ def get_history():
             0
         )
 
-        history += (
+        parts.append(
             f"🚗 {plate}\n"
             f"📍 {camera} - {location}\n"
             f"🕒 {date}  {time}\n"
             f"🎯 Confidence: {confidence}\n\n"
         )
 
-    return history
+    return "".join(parts)
 
 
 # ============================================================

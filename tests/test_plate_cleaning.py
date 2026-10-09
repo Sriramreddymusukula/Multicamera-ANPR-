@@ -18,7 +18,7 @@ sys.path.insert(
     )
 )
 
-from detector import clean_plate_text
+from plate_cleaning import clean_plate_text
 
 
 def test_clean_plate_text():
@@ -79,7 +79,7 @@ def test_config_paths_are_absolute():
 
 def test_candidate_extraction():
 
-    from detector import find_plate_candidates
+    from plate_cleaning import find_plate_candidates
 
     def best(text):
 

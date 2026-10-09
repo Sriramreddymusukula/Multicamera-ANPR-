@@ -11,8 +11,7 @@ at least config.VIDEO_SINGLE_HIT_CONF confidence) to be accepted.
 Only the best frame of each accepted vehicle is saved to output/.
 """
 
-import contextlib
-import io
+import logging
 import os
 import uuid
 from datetime import datetime
@@ -20,12 +19,15 @@ from datetime import datetime
 import cv2
 
 from config import (
+    EVIDENCE_JPEG_QUALITY,
     OUTPUT_DIR,
     VIDEO_MIN_HITS,
     VIDEO_SAMPLE_FPS,
     VIDEO_SINGLE_HIT_CONF
 )
 from detector import detect_number_plates, preprocess_plate
+
+logger = logging.getLogger(__name__)
 
 
 def read_preview_frame(video_path):
@@ -41,7 +43,7 @@ def read_preview_frame(video_path):
 
     except Exception as error:
 
-        print("Video preview error:", error)
+        logger.warning("Video preview error: %s", error)
 
         return None
 
@@ -50,9 +52,14 @@ def read_preview_frame(video_path):
         cap.release()
 
 
-def analyze_video(video_path, progress_callback=None):
+def analyze_video(video_path, progress_callback=None, should_cancel=None):
     """
     Analyze a video file.
+
+    Parameters:
+        progress_callback : called as (sampled_frames, seconds)
+        should_cancel     : optional () -> bool called between
+                            frames; analysis stops early when True
 
     Returns a dictionary:
 
@@ -69,33 +76,45 @@ def analyze_video(video_path, progress_callback=None):
             f"Could not open video: {video_path}"
         )
 
-    fps = cap.get(cv2.CAP_PROP_FPS)
-
-    if not fps or fps <= 0:
-
-        fps = 25.0
-
-    total_frames = cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0
-
-    duration = total_frames / fps if total_frames > 0 else 0.0
-
-    step = max(1, int(round(fps / VIDEO_SAMPLE_FPS)))
-
-    print(
-        f"Video: {video_path}\n"
-        f"  fps={fps:.1f} duration={duration:.1f}s "
-        f"sampling every {step} frame(s)"
-    )
-
-    groups = {}
-
-    frame_index = 0
-
-    sampled_frames = 0
-
     try:
 
+        fps = cap.get(cv2.CAP_PROP_FPS)
+
+        if not fps or fps <= 0:
+
+            fps = 25.0
+
+        total_frames = cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0
+
+        duration = total_frames / fps if total_frames > 0 else 0.0
+
+        step = max(1, int(round(fps / VIDEO_SAMPLE_FPS)))
+
+        logger.info(
+            "Video: %s | fps=%.1f duration=%.1fs "
+            "sampling every %d frame(s)",
+            video_path,
+            fps,
+            duration,
+            step
+        )
+
+        groups = {}
+
+        frame_index = 0
+
+        sampled_frames = 0
+
         while True:
+
+            if should_cancel and should_cancel():
+
+                logger.info(
+                    "Video analysis cancelled after %d frame(s)",
+                    sampled_frames
+                )
+
+                break
 
             # grab() skips frames cheaply; retrieve() decodes
             # only the frames we actually analyze.
@@ -123,14 +142,11 @@ def analyze_video(video_path, progress_callback=None):
                             seconds
                         )
 
-                    # Silence the per-frame detector chatter;
-                    # real errors are still raised as exceptions.
-                    with contextlib.redirect_stdout(io.StringIO()):
-
-                        detections = detect_number_plates(
-                            frame,
-                            save_artifacts=False
-                        )
+                    detections = detect_number_plates(
+                        frame,
+                        save_artifacts=False,
+                        verbose=False
+                    )
 
                     for detection in detections:
 
@@ -150,9 +166,11 @@ def analyze_video(video_path, progress_callback=None):
 
     detections = _finalize_groups(groups)
 
-    print(
-        f"Video analysis: {sampled_frames} frame(s) analyzed, "
-        f"{len(detections)} vehicle(s) accepted"
+    logger.info(
+        "Video analysis: %d frame(s) analyzed, "
+        "%d vehicle(s) accepted",
+        sampled_frames,
+        len(detections)
     )
 
     return {
@@ -202,7 +220,7 @@ def _encode_jpeg(frame):
     ok, buffer = cv2.imencode(
         ".jpg",
         frame,
-        [int(cv2.IMWRITE_JPEG_QUALITY), 88]
+        [int(cv2.IMWRITE_JPEG_QUALITY), EVIDENCE_JPEG_QUALITY]
     )
 
     return buffer.tobytes() if ok else None
@@ -220,10 +238,11 @@ def _finalize_groups(groups):
             and group["best_confidence"] < VIDEO_SINGLE_HIT_CONF
         ):
 
-            print(
-                f"  dropped '{plate}': "
-                f"{group['hits']} hit(s), "
-                f"conf {group['best_confidence']:.2f}"
+            logger.info(
+                "Dropped '%s': %d hit(s), conf %.2f",
+                plate,
+                group["hits"],
+                group["best_confidence"]
             )
 
             continue

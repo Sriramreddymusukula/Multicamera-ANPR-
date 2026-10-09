@@ -1,1011 +1,1101 @@
-import customtkinter as ctk
-from tkinter import filedialog, messagebox
-from PIL import Image, ImageTk
-from detector import (
-    detect_number_plates,
-    check_dependencies
-)
-from database import save_detections
-from history import get_history
-from config import CAMERAS, OUTPUT_DIR, VIDEO_FILE_TYPES
-from video import analyze_video, read_preview_frame
+"""
+City-Wide AI Traffic Engine - desktop dashboard.
 
+The GUI owns session state (detections + trajectories), starts
+detection work on background threads and renders results on the
+Tk main thread. Workers communicate exclusively through a queue -
+they never touch widgets.
+"""
+
+import logging
 import os
-import cv2
 import queue
 import threading
-from datetime import datetime
 from collections import defaultdict
+from tkinter import filedialog, messagebox
 
+import cv2
+import customtkinter as ctk
+from PIL import Image, ImageTk
 
-# ============================================================
-# THEME
-# ============================================================
+from analytics import (
+    INVALID_PLATES,
+    active_camera_count,
+    camera_statistics,
+    multi_camera_vehicles,
+    traffic_activity,
+    unique_plate_count,
+    valid_detections,
+    vehicle_observation_statistics
+)
+from config import (
+    CAMERA_LOCATION_BY_ID,
+    CAMERAS,
+    IMAGE_FILE_TYPES,
+    LOG_LEVEL,
+    OUTPUT_DIR,
+    VIDEO_FILE_TYPES
+)
+from detector import check_dependencies
+from history import get_history
+from processing import process_images, process_video
+from video import read_preview_frame
+
+logger = logging.getLogger(__name__)
 
 ctk.set_appearance_mode("dark")
 ctk.set_default_color_theme("blue")
 
-
-# ============================================================
-# MAIN WINDOW
-# ============================================================
-
-app = ctk.CTk()
-
-app.title(
-    "City-Wide AI Engine - Multi-Camera ANPR"
-)
-
-app.geometry("1500x950")
-app.minsize(1200, 750)
+WINDOW_TITLE = "City-Wide AI Engine - Multi-Camera ANPR"
+PREVIEW_SIZE = (760, 300)
+POLL_INTERVAL_MS = 200
 
 
-# ============================================================
-# CAMERA CONFIGURATION
-# ============================================================
-# The camera list is defined in config.py and imported above.
+class ANPRApp:
 
+    def __init__(self):
 
-# ============================================================
-# APPLICATION DATA
-# ============================================================
+        self.selected_images = []
+        self.selected_video = None
+        self.all_detections = []
+        self.trajectory_data = defaultdict(list)
+        self.result_queue = queue.Queue()
 
-selected_images = []
+        self.app = ctk.CTk()
+        self.app.title(WINDOW_TITLE)
+        self.app.geometry("1500x950")
+        self.app.minsize(1200, 750)
 
-selected_video = None
+        self._build_ui()
 
-current_camera = None
+        self.update_camera_info()
+        self.update_statistics()
+        self.update_analytics_view()
+        self._check_startup_dependencies()
 
-all_detections = []
+        self.app.after(POLL_INTERVAL_MS, self.poll_results)
 
-trajectory_data = defaultdict(list)
+    def run(self):
 
-result_queue = queue.Queue()
+        self.app.mainloop()
 
+    # ========================================================
+    # UI CONSTRUCTION
+    # ========================================================
 
-# ============================================================
-# CONSTANTS
-# ============================================================
+    def _build_ui(self):
 
-INVALID_PLATES = [
-    "OCR Failed",
-    "No Plate Detected"
-]
+        header_frame = ctk.CTkFrame(
+            self.app,
+            fg_color="transparent"
+        )
 
+        header_frame.pack(
+            fill="x",
+            padx=25,
+            pady=(20, 5)
+        )
 
-# ============================================================
-# HELPER FUNCTIONS
-# ============================================================
+        ctk.CTkLabel(
+            header_frame,
+            text="🚦 CITY-WIDE AI TRAFFIC ENGINE",
+            font=("Arial", 30, "bold")
+        ).pack()
 
-def get_selected_camera():
-
-    camera_name = camera_dropdown.get()
-
-    if camera_name not in CAMERAS:
-        return None
-
-    return CAMERAS[camera_name]
-
-
-def get_valid_detections():
-
-    return [
-        detection
-        for detection in all_detections
-        if detection["plate_number"]
-        not in INVALID_PLATES
-    ]
-
-
-def update_camera_info(choice=None):
-
-    camera = get_selected_camera()
-
-    if camera:
-
-        camera_info_label.configure(
+        ctk.CTkLabel(
+            header_frame,
             text=(
-                f"Camera ID: {camera['id']}\n"
-                f"Location: {camera['location']}"
-            )
+                "Multi-Camera ANPR • Vehicle Trajectory "
+                "Tracking • Urban Traffic Analytics"
+            ),
+            font=("Arial", 15)
+        ).pack(
+            pady=(5, 0)
         )
 
+        self._build_camera_bar()
 
-def update_statistics():
+        self._build_stat_cards()
 
-    valid_detections = get_valid_detections()
+        main_frame = ctk.CTkFrame(self.app)
 
-    unique_plates = set(
-        detection["plate_number"]
-        for detection in valid_detections
-    )
-
-    active_cameras = len(
-        set(
-            detection["camera_id"]
-            for detection in all_detections
-        )
-    )
-
-    multi_camera_count = sum(
-        1
-        for plate, events in trajectory_data.items()
-        if len(
-            set(
-                event["camera_id"]
-                for event in events
-            )
-        ) > 1
-    )
-
-    total_label.configure(
-        text=str(len(valid_detections))
-    )
-
-    unique_label.configure(
-        text=str(len(unique_plates))
-    )
-
-    camera_count_label.configure(
-        text=str(active_cameras)
-    )
-
-    trajectory_count_label.configure(
-        text=str(multi_camera_count)
-    )
-
-
-# ============================================================
-# TRAFFIC ANALYTICS
-# ============================================================
-
-def calculate_traffic_activity():
-
-    valid_detections = get_valid_detections()
-
-    count = len(valid_detections)
-
-    if count == 0:
-        return "NO DATA"
-
-    if count <= 2:
-        return "LOW"
-
-    elif count <= 5:
-        return "MODERATE"
-
-    else:
-        return "HIGH"
-
-
-def get_camera_statistics():
-
-    camera_stats = defaultdict(int)
-
-    for detection in get_valid_detections():
-
-        camera_id = detection["camera_id"]
-
-        camera_stats[camera_id] += 1
-
-    return camera_stats
-
-
-def get_location_statistics():
-
-    location_stats = defaultdict(int)
-
-    for detection in get_valid_detections():
-
-        location = detection["location"]
-
-        location_stats[location] += 1
-
-    return location_stats
-
-
-def get_vehicle_observation_statistics():
-
-    vehicle_stats = defaultdict(int)
-
-    for detection in get_valid_detections():
-
-        plate = detection["plate_number"]
-
-        vehicle_stats[plate] += 1
-
-    return vehicle_stats
-
-
-def get_multi_camera_vehicles():
-
-    multi_camera = []
-
-    for plate, events in trajectory_data.items():
-
-        if plate in INVALID_PLATES:
-            continue
-
-        cameras = list(
-            dict.fromkeys(
-                event["camera_id"]
-                for event in events
-            )
+        main_frame.pack(
+            fill="both",
+            expand=True,
+            padx=25,
+            pady=15
         )
 
-        if len(cameras) > 1:
+        self._build_left_panel(main_frame)
 
-            multi_camera.append(
-                {
-                    "plate": plate,
-                    "cameras": cameras,
-                    "events": events
-                }
-            )
+        self._build_right_panel(main_frame)
 
-    return multi_camera
+    def _build_camera_bar(self):
 
+        camera_frame = ctk.CTkFrame(self.app)
 
-def update_analytics_view():
+        camera_frame.pack(
+            fill="x",
+            padx=25,
+            pady=15
+        )
 
-    analytics_textbox.delete(
-        "1.0",
-        "end"
-    )
+        ctk.CTkLabel(
+            camera_frame,
+            text="📡 Camera / Location",
+            font=("Arial", 17, "bold")
+        ).pack(
+            side="left",
+            padx=20,
+            pady=15
+        )
 
-    valid_detections = get_valid_detections()
+        self.camera_dropdown = ctk.CTkComboBox(
+            camera_frame,
+            values=list(CAMERAS.keys()),
+            width=320,
+            height=40,
+            command=self.update_camera_info
+        )
 
-    if not valid_detections:
+        self.camera_dropdown.set(
+            list(CAMERAS.keys())[0]
+        )
 
-        analytics_textbox.insert(
+        self.camera_dropdown.pack(
+            side="left",
+            padx=10
+        )
+
+        self.camera_info_label = ctk.CTkLabel(
+            camera_frame,
+            text=(
+                "Camera ID: CAM-01\n"
+                "Location: Suchitra Junction"
+            ),
+            font=("Arial", 14),
+            justify="left"
+        )
+
+        self.camera_info_label.pack(
+            side="left",
+            padx=30
+        )
+
+    def _build_stat_cards(self):
+
+        stats_frame = ctk.CTkFrame(
+            self.app,
+            fg_color="transparent"
+        )
+
+        stats_frame.pack(
+            fill="x",
+            padx=25,
+            pady=5
+        )
+
+        self.total_label = self._make_stat_card(
+            stats_frame,
+            "TOTAL OBSERVATIONS"
+        )
+
+        self.unique_label = self._make_stat_card(
+            stats_frame,
+            "UNIQUE VEHICLES"
+        )
+
+        self.camera_count_label = self._make_stat_card(
+            stats_frame,
+            "ACTIVE CAMERAS"
+        )
+
+        self.trajectory_count_label = self._make_stat_card(
+            stats_frame,
+            "MULTI-CAMERA VEHICLES"
+        )
+
+    def _make_stat_card(self, parent, title):
+
+        card = ctk.CTkFrame(parent)
+
+        card.pack(
+            side="left",
+            fill="both",
+            expand=True,
+            padx=5
+        )
+
+        ctk.CTkLabel(
+            card,
+            text=title,
+            font=("Arial", 13, "bold")
+        ).pack(
+            pady=(12, 3)
+        )
+
+        value_label = ctk.CTkLabel(
+            card,
+            text="0",
+            font=("Arial", 25, "bold")
+        )
+
+        value_label.pack(
+            pady=(0, 12)
+        )
+
+        return value_label
+
+    def _build_left_panel(self, main_frame):
+
+        left_frame = ctk.CTkFrame(
+            main_frame,
+            width=350
+        )
+
+        left_frame.pack(
+            side="left",
+            fill="y",
+            padx=(15, 10),
+            pady=15
+        )
+
+        left_frame.pack_propagate(False)
+
+        ctk.CTkButton(
+            left_frame,
+            text="📷 Upload Image",
+            width=280,
+            height=45,
+            command=self.upload_image
+        ).pack(
+            pady=(25, 10)
+        )
+
+        ctk.CTkButton(
+            left_frame,
+            text="📂 Upload Multiple Images",
+            width=280,
+            height=45,
+            command=self.upload_multiple_images
+        ).pack(
+            pady=10
+        )
+
+        ctk.CTkButton(
+            left_frame,
+            text="🎬 Upload Video",
+            width=280,
+            height=45,
+            command=self.upload_video
+        ).pack(
+            pady=10
+        )
+
+        self.detect_btn = ctk.CTkButton(
+            left_frame,
+            text="🤖 Run AI Detection",
+            width=280,
+            height=50,
+            command=self.detect_plate
+        )
+
+        self.detect_btn.pack(
+            pady=20
+        )
+
+        ctk.CTkButton(
+            left_frame,
+            text="Clear Selection",
+            width=280,
+            height=40,
+            command=self.clear_selection
+        ).pack(
+            pady=5
+        )
+
+        self.selected_files_label = ctk.CTkLabel(
+            left_frame,
+            text="Selected Images: 0",
+            font=("Arial", 13),
+            wraplength=280
+        )
+
+        self.selected_files_label.pack(
+            pady=20
+        )
+
+        self.status_label = ctk.CTkLabel(
+            left_frame,
+            text="Ready.",
+            font=("Arial", 13),
+            wraplength=280
+        )
+
+        self.status_label.pack(
+            pady=10
+        )
+
+        ctk.CTkButton(
+            left_frame,
+            text="📁 Open Output Folder",
+            width=280,
+            height=40,
+            command=self.view_output_folder
+        ).pack(
+            pady=10
+        )
+
+        ctk.CTkButton(
+            left_frame,
+            text="View All Detection Events",
+            width=280,
+            height=40,
+            command=self.show_all_detections
+        ).pack(
+            pady=10
+        )
+
+        ctk.CTkButton(
+            left_frame,
+            text="🗄️ View Detection History",
+            width=280,
+            height=40,
+            command=self.show_history
+        ).pack(
+            pady=10
+        )
+
+        ctk.CTkButton(
+            left_frame,
+            text="Clear Session Data",
+            width=280,
+            height=40,
+            command=self.clear_all_data
+        ).pack(
+            pady=10
+        )
+
+    def _build_right_panel(self, main_frame):
+
+        right_frame = ctk.CTkScrollableFrame(main_frame)
+
+        right_frame.pack(
+            side="right",
+            fill="both",
+            expand=True,
+            padx=(10, 15),
+            pady=15
+        )
+
+        ctk.CTkLabel(
+            right_frame,
+            text="Vehicle Image",
+            font=("Arial", 18, "bold")
+        ).pack(
+            pady=(10, 5)
+        )
+
+        self.image_label = ctk.CTkLabel(
+            right_frame,
+            text="Image Preview Area",
+            font=("Arial", 20),
+            height=300
+        )
+
+        self.image_label.pack(
+            fill="x",
+            padx=20,
+            pady=10
+        )
+
+        ctk.CTkLabel(
+            right_frame,
+            text="Detection Results",
+            font=("Arial", 17, "bold")
+        ).pack(
+            pady=(5, 5)
+        )
+
+        self.result_textbox = ctk.CTkTextbox(
+            right_frame,
+            height=170,
+            wrap="word",
+            font=("Consolas", 13)
+        )
+
+        self.result_textbox.pack(
+            fill="x",
+            padx=20,
+            pady=5
+        )
+
+        ctk.CTkLabel(
+            right_frame,
+            text="🚗 Multi-Camera Vehicle Trajectory",
+            font=("Arial", 17, "bold")
+        ).pack(
+            pady=(15, 5)
+        )
+
+        self.trajectory_textbox = ctk.CTkTextbox(
+            right_frame,
+            height=230,
+            wrap="word",
+            font=("Consolas", 13)
+        )
+
+        self.trajectory_textbox.pack(
+            fill="x",
+            padx=20,
+            pady=(5, 20)
+        )
+
+        self.trajectory_textbox.insert(
+            "end",
+            "No vehicle trajectories yet."
+        )
+
+        ctk.CTkLabel(
+            right_frame,
+            text="🚦 Urban Traffic Analytics",
+            font=("Arial", 18, "bold")
+        ).pack(
+            pady=(5, 5)
+        )
+
+        self.analytics_textbox = ctk.CTkTextbox(
+            right_frame,
+            height=420,
+            wrap="word",
+            font=("Consolas", 13)
+        )
+
+        self.analytics_textbox.pack(
+            fill="x",
+            padx=20,
+            pady=(5, 20)
+        )
+
+        self.analytics_textbox.insert(
             "end",
             "No traffic analytics available yet.\n\n"
             "Upload vehicle images and run AI Detection."
         )
 
-        return
-
-    # ========================================================
-    # BASIC STATISTICS
-    # ========================================================
-
-    total_observations = len(
-        valid_detections
-    )
-
-    unique_vehicles = len(
-        set(
-            detection["plate_number"]
-            for detection in valid_detections
+        ctk.CTkLabel(
+            right_frame,
+            text="System Information",
+            font=("Arial", 17, "bold")
+        ).pack(
+            pady=(5, 5)
         )
-    )
 
-    active_cameras = len(
-        set(
-            detection["camera_id"]
-            for detection in valid_detections
+        self.info_textbox = ctk.CTkTextbox(
+            right_frame,
+            height=150,
+            wrap="word",
+            font=("Consolas", 12)
         )
-    )
 
-    multi_camera_vehicles = len(
-        get_multi_camera_vehicles()
-    )
+        self.info_textbox.pack(
+            fill="x",
+            padx=20,
+            pady=(5, 20)
+        )
 
-    activity_level = calculate_traffic_activity()
-
-    # ========================================================
-    # HEADER
-    # ========================================================
-
-    analytics_textbox.insert(
-        "end",
-        "URBAN TRAFFIC ANALYTICS\n"
-    )
-
-    analytics_textbox.insert(
-        "end",
-        "============================================\n\n"
-    )
-
-    # ========================================================
-    # SUMMARY
-    # ========================================================
-
-    analytics_textbox.insert(
-        "end",
-        "TRAFFIC SUMMARY\n"
-    )
-
-    analytics_textbox.insert(
-        "end",
-        "--------------------------------------------\n"
-    )
-
-    analytics_textbox.insert(
-        "end",
-        f"Vehicle Observations : {total_observations}\n"
-    )
-
-    analytics_textbox.insert(
-        "end",
-        f"Unique Vehicles      : {unique_vehicles}\n"
-    )
-
-    analytics_textbox.insert(
-        "end",
-        f"Active Cameras       : {active_cameras}\n"
-    )
-
-    analytics_textbox.insert(
-        "end",
-        f"Multi-Camera Vehicles: {multi_camera_vehicles}\n"
-    )
-
-    analytics_textbox.insert(
-        "end",
-        f"Traffic Activity     : {activity_level}\n\n"
-    )
-
-    # ========================================================
-    # CAMERA ACTIVITY
-    # ========================================================
-
-    analytics_textbox.insert(
-        "end",
-        "CAMERA ACTIVITY\n"
-    )
-
-    analytics_textbox.insert(
-        "end",
-        "--------------------------------------------\n"
-    )
-
-    camera_stats = get_camera_statistics()
-
-    if not camera_stats:
-
-        analytics_textbox.insert(
+        self.info_textbox.insert(
             "end",
-            "No camera observations.\n\n"
-        )
-
-    else:
-
-        for camera_id, count in sorted(
-            camera_stats.items()
-        ):
-
-            location = "Unknown"
-
-            for camera_name, camera_info in CAMERAS.items():
-
-                if camera_info["id"] == camera_id:
-
-                    location = camera_info[
-                        "location"
-                    ]
-
-                    break
-
-            analytics_textbox.insert(
-                "end",
-                f"{camera_id:<10} "
-                f"{location:<22} "
-                f"{count} observation(s)\n"
-            )
-
-        analytics_textbox.insert(
-            "end",
+            "CITY-WIDE AI TRAFFIC ENGINE\n"
+            "--------------------------------------------\n"
+            "AI Engine        : YOLOv8 + Tesseract OCR\n"
+            "Input Mode       : Image + Video Upload\n"
+            "Video Mode       : Frame Sampling + Temporal Voting\n"
+            "Vehicle Identity : License Plate Number\n"
+            "Camera Mode      : Multi-Camera Simulation\n"
+            "Association       : Cross-Camera ANPR\n"
+            "Trajectory        : Camera Route Reconstruction\n"
+            "Analytics         : Session-Based Traffic Activity\n"
+            "Database          : vehicle_database.csv (persistent)\n"
+            "Processing        : Background Thread\n"
             "\n"
+            "Current Prototype:\n"
+            "Individual vehicle images are assigned to "
+            "simulated camera locations to demonstrate "
+            "city-wide ANPR, vehicle association, routes "
+            "and traffic activity analytics.\n"
         )
 
     # ========================================================
-    # VEHICLE OBSERVATION FREQUENCY
+    # SESSION HELPERS
     # ========================================================
 
-    analytics_textbox.insert(
-        "end",
-        "VEHICLE OBSERVATION FREQUENCY\n"
-    )
+    def get_selected_camera(self):
 
-    analytics_textbox.insert(
-        "end",
-        "--------------------------------------------\n"
-    )
+        camera_name = self.camera_dropdown.get()
 
-    vehicle_stats = get_vehicle_observation_statistics()
+        if camera_name not in CAMERAS:
 
-    sorted_vehicles = sorted(
-        vehicle_stats.items(),
-        key=lambda item: item[1],
-        reverse=True
-    )
+            return None
 
-    for plate, count in sorted_vehicles:
+        return CAMERAS[camera_name]
 
-        analytics_textbox.insert(
-            "end",
-            f"{plate:<15} "
-            f"{count} observation(s)\n"
-        )
+    def update_camera_info(self, choice=None):
 
-    analytics_textbox.insert(
-        "end",
-        "\n"
-    )
+        camera = self.get_selected_camera()
 
-    # ========================================================
-    # MULTI-CAMERA MOVEMENT
-    # ========================================================
+        if camera:
 
-    analytics_textbox.insert(
-        "end",
-        "MULTI-CAMERA VEHICLE MOVEMENT\n"
-    )
-
-    analytics_textbox.insert(
-        "end",
-        "--------------------------------------------\n"
-    )
-
-    multi_camera = get_multi_camera_vehicles()
-
-    if not multi_camera:
-
-        analytics_textbox.insert(
-            "end",
-            "No multi-camera movement detected.\n\n"
-        )
-
-    else:
-
-        for vehicle in multi_camera:
-
-            plate = vehicle["plate"]
-
-            locations = list(
-                dict.fromkeys(
-                    event["location"]
-                    for event in vehicle["events"]
+            self.camera_info_label.configure(
+                text=(
+                    f"Camera ID: {camera['id']}\n"
+                    f"Location: {camera['location']}"
                 )
             )
 
-            route = " → ".join(
-                locations
-            )
+    def update_statistics(self):
 
-            analytics_textbox.insert(
-                "end",
-                f"Vehicle : {plate}\n"
-            )
+        valid = valid_detections(self.all_detections)
 
-            analytics_textbox.insert(
-                "end",
-                f"Route   : {route}\n"
-            )
+        self.total_label.configure(
+            text=str(len(valid))
+        )
 
-            analytics_textbox.insert(
-                "end",
-                f"Cameras : "
-                f"{' → '.join(vehicle['cameras'])}\n\n"
+        self.unique_label.configure(
+            text=str(unique_plate_count(valid))
+        )
+
+        self.camera_count_label.configure(
+            text=str(active_camera_count(self.all_detections))
+        )
+
+        self.trajectory_count_label.configure(
+            text=str(
+                len(
+                    multi_camera_vehicles(self.trajectory_data)
+                )
             )
+        )
 
     # ========================================================
-    # INTERPRETATION
+    # ANALYTICS
     # ========================================================
 
-    analytics_textbox.insert(
-        "end",
-        "ANALYTICS INTERPRETATION\n"
-    )
+    def update_analytics_view(self):
 
-    analytics_textbox.insert(
-        "end",
-        "--------------------------------------------\n"
-    )
+        valid = valid_detections(self.all_detections)
 
-    if activity_level == "LOW":
+        self.analytics_textbox.delete("1.0", "end")
 
-        interpretation = (
-            "Low vehicle observation activity "
-            "in the current demo session."
-        )
+        if not valid:
 
-    elif activity_level == "MODERATE":
-
-        interpretation = (
-            "Moderate vehicle observation activity "
-            "across the selected cameras."
-        )
-
-    else:
-
-        interpretation = (
-            "High vehicle observation activity "
-            "in the current demo session."
-        )
-
-    analytics_textbox.insert(
-        "end",
-        f"{interpretation}\n\n"
-    )
-
-    analytics_textbox.insert(
-        "end",
-        "Note: Traffic Activity is calculated from "
-        "ANPR observations in the current image-based "
-        "demo session. It is not a real-time congestion "
-        "measurement.\n"
-    )
-
-    analytics_textbox.see("end")
-
-
-# ============================================================
-# IMAGE PREVIEW
-# ============================================================
-
-def preview_image(image_path):
-
-    try:
-
-        img = Image.open(image_path)
-
-        img.thumbnail(
-            (760, 300)
-        )
-
-        photo = ImageTk.PhotoImage(img)
-
-        image_label.configure(
-            image=photo,
-            text=""
-        )
-
-        image_label.image = photo
-
-    except Exception as e:
-
-        print(
-            "Preview error:",
-            e
-        )
-
-
-def preview_frame(frame):
-    """Preview an OpenCV BGR frame in the image area."""
-
-    try:
-
-        rgb = cv2.cvtColor(
-            frame,
-            cv2.COLOR_BGR2RGB
-        )
-
-        img = Image.fromarray(rgb)
-
-        img.thumbnail(
-            (760, 300)
-        )
-
-        photo = ImageTk.PhotoImage(img)
-
-        image_label.configure(
-            image=photo,
-            text=""
-        )
-
-        image_label.image = photo
-
-    except Exception as e:
-
-        print(
-            "Frame preview error:",
-            e
-        )
-
-
-# ============================================================
-# UPLOAD SINGLE IMAGE
-# ============================================================
-
-def upload_image():
-
-    global selected_images
-    global selected_video
-
-    file_path = filedialog.askopenfilename(
-        title="Select Vehicle Image",
-        filetypes=[
-            (
-                "Image Files",
-                "*.jpg *.jpeg *.png *.bmp"
+            self.analytics_textbox.insert(
+                "end",
+                "No traffic analytics available yet.\n\n"
+                "Upload vehicle images and run AI Detection."
             )
-        ]
-    )
 
-    if not file_path:
-        return
+            return
 
-    selected_video = None
-
-    selected_images = [
-        file_path
-    ]
-
-    preview_image(
-        file_path
-    )
-
-    selected_files_label.configure(
-        text=(
-            f"Selected Images: 1\n"
-            f"{os.path.basename(file_path)}"
+        self.analytics_textbox.insert(
+            "end",
+            self._build_analytics_text(valid)
         )
-    )
 
-    status_label.configure(
-        text="Image selected. Ready for detection."
-    )
+        self.analytics_textbox.see("end")
 
+    def _build_analytics_text(self, valid):
 
-# ============================================================
-# UPLOAD MULTIPLE IMAGES
-# ============================================================
+        activity_level = traffic_activity(valid)
 
-def upload_multiple_images():
+        multi_camera = multi_camera_vehicles(self.trajectory_data)
 
-    global selected_images
-    global selected_video
+        parts = [
 
-    file_paths = filedialog.askopenfilenames(
-        title="Select Multiple Vehicle Images",
-        filetypes=[
-            (
-                "Image Files",
-                "*.jpg *.jpeg *.png *.bmp"
+            "URBAN TRAFFIC ANALYTICS\n",
+
+            "============================================\n\n",
+
+            "TRAFFIC SUMMARY\n",
+
+            "--------------------------------------------\n",
+
+            f"Vehicle Observations : {len(valid)}\n",
+
+            f"Unique Vehicles      : "
+            f"{unique_plate_count(valid)}\n",
+
+            f"Active Cameras       : "
+            f"{active_camera_count(valid)}\n",
+
+            f"Multi-Camera Vehicles: {len(multi_camera)}\n",
+
+            f"Traffic Activity     : {activity_level}\n\n",
+
+            "CAMERA ACTIVITY\n",
+
+            "--------------------------------------------\n"
+        ]
+
+        camera_stats = camera_statistics(valid)
+
+        if not camera_stats:
+
+            parts.append("No camera observations.\n\n")
+
+        else:
+
+            for camera_id, count in sorted(camera_stats.items()):
+
+                location = CAMERA_LOCATION_BY_ID.get(
+                    camera_id,
+                    "Unknown"
+                )
+
+                parts.append(
+                    f"{camera_id:<10} "
+                    f"{location:<22} "
+                    f"{count} observation(s)\n"
+                )
+
+            parts.append("\n")
+
+        parts.append("VEHICLE OBSERVATION FREQUENCY\n")
+
+        parts.append("--------------------------------------------\n")
+
+        vehicle_stats = vehicle_observation_statistics(valid)
+
+        sorted_vehicles = sorted(
+            vehicle_stats.items(),
+            key=lambda item: item[1],
+            reverse=True
+        )
+
+        for plate, count in sorted_vehicles:
+
+            parts.append(
+                f"{plate:<15} "
+                f"{count} observation(s)\n"
             )
-        ]
-    )
 
-    if not file_paths:
-        return
+        parts.append("\n")
 
-    selected_video = None
+        parts.append("MULTI-CAMERA VEHICLE MOVEMENT\n")
 
-    selected_images = list(
-        file_paths
-    )
+        parts.append("--------------------------------------------\n")
 
-    preview_image(
-        selected_images[0]
-    )
+        if not multi_camera:
 
-    if len(selected_images) == 1:
+            parts.append("No multi-camera movement detected.\n\n")
 
-        text = (
-            "Selected Images: 1\n"
-            f"{os.path.basename(selected_images[0])}"
-        )
+        else:
 
-    else:
+            for vehicle in multi_camera:
 
-        text = (
-            f"Selected Images: "
-            f"{len(selected_images)}\n"
-            f"First: "
-            f"{os.path.basename(selected_images[0])}"
-        )
+                locations = list(
+                    dict.fromkeys(
+                        event["location"]
+                        for event in vehicle["events"]
+                    )
+                )
 
-    selected_files_label.configure(
-        text=text
-    )
+                route = " → ".join(locations)
 
-    status_label.configure(
-        text=(
-            f"{len(selected_images)} images "
-            "selected. Ready for processing."
-        )
-    )
+                parts.append(
+                    f"Vehicle : {vehicle['plate']}\n"
+                )
 
+                parts.append(
+                    f"Route   : {route}\n"
+                )
 
-# ============================================================
-# UPLOAD VIDEO
-# ============================================================
+                parts.append(
+                    f"Cameras : "
+                    f"{' → '.join(vehicle['cameras'])}\n\n"
+                )
 
-def upload_video():
+        parts.append("ANALYTICS INTERPRETATION\n")
 
-    global selected_images
-    global selected_video
+        parts.append("--------------------------------------------\n")
 
-    file_path = filedialog.askopenfilename(
-        title="Select Vehicle Video",
-        filetypes=[
-            (
-                "Video Files",
-                VIDEO_FILE_TYPES
+        if activity_level == "LOW":
+
+            interpretation = (
+                "Low vehicle observation activity "
+                "in the current demo session."
             )
+
+        elif activity_level == "MODERATE":
+
+            interpretation = (
+                "Moderate vehicle observation activity "
+                "across the selected cameras."
+            )
+
+        else:
+
+            interpretation = (
+                "High vehicle observation activity "
+                "in the current demo session."
+            )
+
+        parts.append(f"{interpretation}\n\n")
+
+        parts.append(
+            "Note: Traffic Activity is calculated from "
+            "ANPR observations in the current image-based "
+            "demo session. It is not a real-time congestion "
+            "measurement.\n"
+        )
+
+        return "".join(parts)
+
+    # ========================================================
+    # TRAJECTORY VIEW
+    # ========================================================
+
+    def update_trajectory_view(self):
+
+        self.trajectory_textbox.delete("1.0", "end")
+
+        if not self.trajectory_data:
+
+            self.trajectory_textbox.insert(
+                "end",
+                "No vehicle trajectories yet."
+            )
+
+            return
+
+        parts = [
+
+            "VEHICLE TRAJECTORIES\n",
+
+            "====================================\n\n"
         ]
-    )
 
-    if not file_path:
+        for plate, events in self.trajectory_data.items():
 
-        return
+            parts.append(f"Vehicle: {plate}\n")
 
-    selected_video = file_path
+            parts.append("Path:\n")
 
-    selected_images = []
+            for event in events:
 
-    frame = read_preview_frame(file_path)
+                parts.append(
+                    f"  {event['camera_id']} "
+                    f"→ {event['location']} "
+                    f"at {event['timestamp']}\n"
+                )
 
-    if frame is not None:
+            unique_cameras = list(
+                dict.fromkeys(
+                    event["camera_id"]
+                    for event in events
+                )
+            )
 
-        preview_frame(frame)
+            unique_locations = list(
+                dict.fromkeys(
+                    event["location"]
+                    for event in events
+                )
+            )
 
-    else:
+            if len(unique_cameras) > 1:
 
-        image_label.configure(
+                path = " → ".join(unique_cameras)
+
+                locations = " → ".join(unique_locations)
+
+                parts.append(f"\nTrajectory: {path}\n")
+
+                parts.append(f"Route: {locations}\n")
+
+                parts.append("\nStatus: MULTI-CAMERA VEHICLE\n")
+
+            else:
+
+                parts.append(
+                    "\nTrajectory: "
+                    "Single camera observation\n"
+                )
+
+            parts.append("------------------------------------\n")
+
+        self.trajectory_textbox.insert("end", "".join(parts))
+
+        self.trajectory_textbox.see("end")
+
+    # ========================================================
+    # IMAGE PREVIEW
+    # ========================================================
+
+    def preview_image(self, image_path):
+
+        try:
+
+            with Image.open(image_path) as img:
+
+                img.thumbnail(PREVIEW_SIZE)
+
+                photo = ImageTk.PhotoImage(img)
+
+            self.image_label.configure(
+                image=photo,
+                text=""
+            )
+
+            self.image_label.image = photo
+
+        except Exception as error:
+
+            logger.warning("Preview error: %s", error)
+
+    def preview_frame(self, frame):
+
+        try:
+
+            rgb = cv2.cvtColor(
+                frame,
+                cv2.COLOR_BGR2RGB
+            )
+
+            img = Image.fromarray(rgb)
+
+            img.thumbnail(PREVIEW_SIZE)
+
+            photo = ImageTk.PhotoImage(img)
+
+            self.image_label.configure(
+                image=photo,
+                text=""
+            )
+
+            self.image_label.image = photo
+
+        except Exception as error:
+
+            logger.warning("Frame preview error: %s", error)
+
+    # ========================================================
+    # UPLOADS
+    # ========================================================
+
+    def upload_image(self):
+
+        file_path = filedialog.askopenfilename(
+            title="Select Vehicle Image",
+            filetypes=[
+                ("Image Files", IMAGE_FILE_TYPES)
+            ]
+        )
+
+        if not file_path:
+
+            return
+
+        self.selected_video = None
+
+        self.selected_images = [file_path]
+
+        self.preview_image(file_path)
+
+        self.selected_files_label.configure(
+            text=(
+                f"Selected Images: 1\n"
+                f"{os.path.basename(file_path)}"
+            )
+        )
+
+        self.status_label.configure(
+            text="Image selected. Ready for detection."
+        )
+
+    def upload_multiple_images(self):
+
+        file_paths = filedialog.askopenfilenames(
+            title="Select Multiple Vehicle Images",
+            filetypes=[
+                ("Image Files", IMAGE_FILE_TYPES)
+            ]
+        )
+
+        if not file_paths:
+
+            return
+
+        self.selected_video = None
+
+        self.selected_images = list(file_paths)
+
+        self.preview_image(self.selected_images[0])
+
+        if len(self.selected_images) == 1:
+
+            text = (
+                "Selected Images: 1\n"
+                f"{os.path.basename(self.selected_images[0])}"
+            )
+
+        else:
+
+            text = (
+                f"Selected Images: "
+                f"{len(self.selected_images)}\n"
+                f"First: "
+                f"{os.path.basename(self.selected_images[0])}"
+            )
+
+        self.selected_files_label.configure(text=text)
+
+        self.status_label.configure(
+            text=(
+                f"{len(self.selected_images)} images "
+                "selected. Ready for processing."
+            )
+        )
+
+    def upload_video(self):
+
+        file_path = filedialog.askopenfilename(
+            title="Select Vehicle Video",
+            filetypes=[
+                ("Video Files", VIDEO_FILE_TYPES)
+            ]
+        )
+
+        if not file_path:
+
+            return
+
+        self.selected_video = file_path
+
+        self.selected_images = []
+
+        frame = read_preview_frame(file_path)
+
+        if frame is not None:
+
+            self.preview_frame(frame)
+
+        else:
+
+            self.image_label.configure(
+                image="",
+                text="Could not read video preview"
+            )
+
+            self.image_label.image = None
+
+        self.selected_files_label.configure(
+            text=(
+                "Selected Video:\n"
+                f"{os.path.basename(file_path)}"
+            )
+        )
+
+        self.status_label.configure(
+            text="Video selected. Ready for detection."
+        )
+
+    def clear_selection(self):
+
+        self.selected_images = []
+
+        self.selected_video = None
+
+        self.image_label.configure(
             image="",
-            text="Could not read video preview"
+            text="Image Preview Area"
         )
 
-        image_label.image = None
+        self.image_label.image = None
 
-    selected_files_label.configure(
-        text=(
-            "Selected Video:\n"
-            f"{os.path.basename(file_path)}"
-        )
-    )
-
-    status_label.configure(
-        text="Video selected. Ready for detection."
-    )
-
-
-# ============================================================
-# CLEAR CURRENT SELECTION
-# ============================================================
-
-def clear_selection():
-
-    global selected_images
-    global selected_video
-
-    selected_images = []
-
-    selected_video = None
-
-    image_label.configure(
-        image="",
-        text="Image Preview Area"
-    )
-
-    image_label.image = None
-
-    selected_files_label.configure(
-        text="Selected Images: 0"
-    )
-
-    result_textbox.delete(
-        "1.0",
-        "end"
-    )
-
-    status_label.configure(
-        text="Selection cleared."
-    )
-
-
-# ============================================================
-# PROCESS IMAGES
-# ============================================================
-
-def detect_plate():
-    """Validate the selection and start detection in a worker thread."""
-
-    has_video = selected_video is not None
-
-    if not selected_images and not has_video:
-
-        messagebox.showwarning(
-            "No Input",
-            "Please upload one or more images "
-            "or a video first."
+        self.selected_files_label.configure(
+            text="Selected Images: 0"
         )
 
-        return
+        self.result_textbox.delete("1.0", "end")
 
-    camera = get_selected_camera()
-
-    if camera is None:
-
-        messagebox.showwarning(
-            "Camera Required",
-            "Please select a camera location."
+        self.status_label.configure(
+            text="Selection cleared."
         )
-
-        return
-
-    result_textbox.delete(
-        "1.0",
-        "end"
-    )
-
-    detect_btn.configure(state="disabled")
-
-    if has_video:
-
-        result_textbox.insert(
-            "end",
-            f"Processing video: "
-            f"{os.path.basename(selected_video)}\n"
-        )
-
-        status_label.configure(
-            text="AI Engine analyzing video..."
-        )
-
-        worker = threading.Thread(
-            target=_process_video,
-            args=(selected_video, dict(camera)),
-            daemon=True
-        )
-
-    else:
-
-        result_textbox.insert(
-            "end",
-            f"Processing {len(selected_images)} image(s) "
-            "with the AI Engine...\n"
-        )
-
-        status_label.configure(
-            text="AI Engine processing images..."
-        )
-
-        worker = threading.Thread(
-            target=_process_images,
-            args=(list(selected_images), dict(camera)),
-            daemon=True
-        )
-
-    worker.start()
-
-
-def _process_images(image_paths, camera):
-    """Background worker: run detection and persist records.
-
-    This function must never touch Tk widgets. Results are
-    handed back to the main thread through result_queue.
-    """
-
-    processed_count = 0
-
-    new_detections = []
 
     # ========================================================
-    # PROCESS EACH IMAGE
+    # DETECTION WORKFLOW
     # ========================================================
 
-    for image_path in image_paths:
+    def detect_plate(self):
 
-        print("\n====================================")
-        print("Processing image:")
-        print(image_path)
-        print("Camera:")
-        print(camera["id"])
-        print("Location:")
-        print(camera["location"])
-        print("====================================")
+        has_video = self.selected_video is not None
 
-        try:
+        if not self.selected_images and not has_video:
 
-            detections = detect_number_plates(
-                image_path
+            messagebox.showwarning(
+                "No Input",
+                "Please upload one or more images "
+                "or a video first."
             )
 
-        except Exception as e:
+            return
 
-            print(
-                "Detection error:",
-                e
+        camera = self.get_selected_camera()
+
+        if camera is None:
+
+            messagebox.showwarning(
+                "Camera Required",
+                "Please select a camera location."
             )
 
-            continue
+            return
 
-        processed_count += 1
+        self.result_textbox.delete("1.0", "end")
 
-        timestamp = datetime.now().strftime(
-            "%Y-%m-%d %H:%M:%S"
-        )
+        self.detect_btn.configure(state="disabled")
 
-        # ====================================================
-        # STORE EVERY DETECTION
-        # ====================================================
+        if has_video:
 
-        for detection in detections:
-
-            plate = detection[
-                "plate_number"
-            ]
-
-            confidence = detection[
-                "confidence"
-            ]
-
-            detection_record = {
-
-                "plate_number": plate,
-
-                "confidence": confidence,
-
-                "camera_id": camera["id"],
-
-                "location": camera["location"],
-
-                "timestamp": timestamp,
-
-                "image_path": image_path,
-
-                "bbox": detection[
-                    "bbox"
-                ],
-
-                "cropped_plate": detection[
-                    "cropped_plate"
-                ],
-
-                "preprocessed_plate": detection[
-                    "preprocessed_plate"
-                ]
-            }
-
-            new_detections.append(
-                detection_record
+            self.result_textbox.insert(
+                "end",
+                f"Processing video: "
+                f"{os.path.basename(self.selected_video)}\n"
             )
 
-    # ========================================================
-    # PERSIST TO DATABASE (WORKER THREAD, NO UI CALLS)
-    # ========================================================
-
-    saved_count = 0
-
-    if new_detections:
-
-        try:
-
-            saved_count = save_detections(
-                new_detections
+            self.status_label.configure(
+                text="AI Engine analyzing video..."
             )
 
-        except Exception as e:
-
-            print(
-                "Database save error:",
-                e
+            self._start_detection_worker(
+                process_video,
+                self.selected_video,
+                dict(camera),
+                progress_callback=self._queue_video_progress
             )
 
-    # ========================================================
-    # HAND BACK TO THE MAIN THREAD
-    # ========================================================
+        else:
 
-    result_queue.put(
-        (
-            "finished",
-            new_detections,
-            f"{processed_count} image(s)",
-            saved_count
-        )
-    )
+            self.result_textbox.insert(
+                "end",
+                f"Processing {len(self.selected_images)} image(s) "
+                "with the AI Engine...\n"
+            )
 
+            self.status_label.configure(
+                text="AI Engine processing images..."
+            )
 
-def _process_video(video_path, camera):
-    """Background worker: analyze a video file (no Tk calls)."""
+            self._start_detection_worker(
+                process_images,
+                list(self.selected_images),
+                dict(camera)
+            )
 
-    def progress(sampled_frames, seconds):
+    def _queue_video_progress(self, sampled_frames, seconds):
 
-        result_queue.put(
+        self.result_queue.put(
             (
                 "progress",
                 f"Analyzing video... {sampled_frames} frame(s) "
@@ -1013,1366 +1103,318 @@ def _process_video(video_path, camera):
             )
         )
 
-    try:
+    def _start_detection_worker(self, worker, *args, **kwargs):
 
-        result = analyze_video(
-            video_path,
-            progress_callback=progress
-        )
+        def run():
 
-        detections = result["detections"]
+            try:
 
-        source_label = (
-            f"video ({result['sampled_frames']} frame(s))"
-        )
+                result = worker(*args, **kwargs)
 
-    except Exception as error:
+            except Exception:
 
-        print("Video analysis error:", error)
+                logger.exception("Detection worker failed")
 
-        detections = []
+                result = {
+                    "detections": [],
+                    "source_label": "input",
+                    "saved_count": 0
+                }
 
-        source_label = "video"
+            self.result_queue.put(
+                (
+                    "finished",
+                    result["detections"],
+                    result["source_label"],
+                    result["saved_count"]
+                )
+            )
 
-    timestamp = datetime.now().strftime(
-        "%Y-%m-%d %H:%M:%S"
-    )
+        threading.Thread(
+            target=run,
+            daemon=True
+        ).start()
 
-    new_detections = []
-
-    for detection in detections:
-
-        new_detections.append({
-
-            "plate_number": detection["plate_number"],
-
-            "confidence": detection["confidence"],
-
-            "camera_id": camera["id"],
-
-            "location": camera["location"],
-
-            "timestamp": timestamp,
-
-            "image_path": detection["image_path"],
-
-            "bbox": detection["bbox"],
-
-            "cropped_plate": detection["cropped_plate"],
-
-            "preprocessed_plate": detection["preprocessed_plate"]
-        })
-
-    saved_count = 0
-
-    if new_detections:
+    def poll_results(self):
 
         try:
 
-            saved_count = save_detections(
-                new_detections
+            while True:
+
+                self._handle_worker_message(
+                    self.result_queue.get_nowait()
+                )
+
+        except queue.Empty:
+
+            pass
+
+        self.app.after(POLL_INTERVAL_MS, self.poll_results)
+
+    def _handle_worker_message(self, message):
+
+        kind = message[0]
+
+        if kind == "progress":
+
+            self.status_label.configure(text=message[1])
+
+        elif kind == "finished":
+
+            self._detection_finished(
+                message[1],
+                message[2],
+                message[3]
             )
 
-        except Exception as e:
+    def _detection_finished(
+        self,
+        new_detections,
+        source_label,
+        saved_count
+    ):
 
-            print(
-                "Database save error:",
-                e
-            )
+        self.all_detections.extend(new_detections)
 
-    result_queue.put(
-        (
-            "finished",
-            new_detections,
-            source_label,
-            saved_count
-        )
-    )
+        for detection in new_detections:
 
+            plate = detection["plate_number"]
 
-def poll_results():
-    """Main-thread queue consumer for worker messages."""
+            if plate not in INVALID_PLATES:
 
-    try:
+                self.trajectory_data[plate].append(detection)
 
-        while True:
+        self.result_textbox.delete("1.0", "end")
 
-            message = result_queue.get_nowait()
+        if not new_detections:
 
-            _handle_worker_message(message)
-
-    except queue.Empty:
-
-        pass
-
-    app.after(
-        200,
-        poll_results
-    )
-
-
-def _handle_worker_message(message):
-    """Dispatch one worker message on the main thread."""
-
-    kind = message[0]
-
-    if kind == "progress":
-
-        status_label.configure(text=message[1])
-
-    elif kind == "finished":
-
-        _detection_finished(
-            message[1],
-            message[2],
-            message[3]
-        )
-
-
-def _detection_finished(
-    new_detections,
-    source_label,
-    saved_count
-):
-    """Main-thread callback: refresh the dashboard."""
-
-    global all_detections
-    global trajectory_data
-
-    # ========================================================
-    # ADD TO GLOBAL DETECTIONS
-    # ========================================================
-
-    all_detections.extend(
-        new_detections
-    )
-
-    # ========================================================
-    # TRAJECTORY DATA
-    # ========================================================
-
-    for detection in new_detections:
-
-        plate = detection["plate_number"]
-
-        if plate not in INVALID_PLATES:
-
-            trajectory_data[
-                plate
-            ].append(
-                detection
-            )
-
-    # ========================================================
-    # DISPLAY RESULTS
-    # ========================================================
-
-    result_textbox.delete(
-        "1.0",
-        "end"
-    )
-
-    if not new_detections:
-
-        result_textbox.insert(
-            "end",
-            "No readable number plates detected.\n"
-        )
-
-    else:
-
-        result_textbox.insert(
-            "end",
-            "CITY-WIDE AI DETECTION RESULTS\n"
-        )
-
-        result_textbox.insert(
-            "end",
-            "====================================\n\n"
-        )
-
-        for index, detection in enumerate(
-            new_detections,
-            start=1
-        ):
-
-            plate = detection[
-                "plate_number"
-            ]
-
-            confidence = detection[
-                "confidence"
-            ]
-
-            camera_id = detection[
-                "camera_id"
-            ]
-
-            location = detection[
-                "location"
-            ]
-
-            timestamp = detection[
-                "timestamp"
-            ]
-
-            image_name = os.path.basename(
-                detection[
-                    "image_path"
-                ]
-            )
-
-            result_textbox.insert(
+            self.result_textbox.insert(
                 "end",
-                f"Detection {index}\n"
-            )
-
-            result_textbox.insert(
-                "end",
-                f"Plate       : {plate}\n"
-            )
-
-            result_textbox.insert(
-                "end",
-                f"Confidence  : "
-                f"{confidence:.2f}\n"
-            )
-
-            result_textbox.insert(
-                "end",
-                f"Camera      : {camera_id}\n"
-            )
-
-            result_textbox.insert(
-                "end",
-                f"Location    : {location}\n"
-            )
-
-            result_textbox.insert(
-                "end",
-                f"Timestamp   : {timestamp}\n"
-            )
-
-            result_textbox.insert(
-                "end",
-                f"Image       : {image_name}\n"
-            )
-
-            result_textbox.insert(
-                "end",
-                "------------------------------------\n"
-            )
-
-    # ========================================================
-    # UPDATE TRAJECTORY
-    # ========================================================
-
-    update_trajectory_view()
-
-    # ========================================================
-    # UPDATE STATISTICS
-    # ========================================================
-
-    update_statistics()
-
-    # ========================================================
-    # UPDATE ANALYTICS
-    # ========================================================
-
-    update_analytics_view()
-
-    # ========================================================
-    # STATUS
-    # ========================================================
-
-    if new_detections:
-
-        preview_image(
-            new_detections[0]["image_path"]
-        )
-
-    status_label.configure(
-        text=(
-            f"Processed {source_label} | "
-            f"Detected {len(new_detections)} plate(s) | "
-            f"Saved {saved_count} record(s)"
-        )
-    )
-
-    detect_btn.configure(state="normal")
-
-
-# ============================================================
-# TRAJECTORY VIEW
-# ============================================================
-
-def update_trajectory_view():
-
-    trajectory_textbox.delete(
-        "1.0",
-        "end"
-    )
-
-    if not trajectory_data:
-
-        trajectory_textbox.insert(
-            "end",
-            "No vehicle trajectories yet."
-        )
-
-        return
-
-    trajectory_textbox.insert(
-        "end",
-        "VEHICLE TRAJECTORIES\n"
-    )
-
-    trajectory_textbox.insert(
-        "end",
-        "====================================\n\n"
-    )
-
-    for plate, events in trajectory_data.items():
-
-        if plate in INVALID_PLATES:
-            continue
-
-        trajectory_textbox.insert(
-            "end",
-            f"Vehicle: {plate}\n"
-        )
-
-        trajectory_textbox.insert(
-            "end",
-            "Path:\n"
-        )
-
-        for event in events:
-
-            trajectory_textbox.insert(
-                "end",
-                f"  {event['camera_id']} "
-                f"→ {event['location']} "
-                f"at {event['timestamp']}\n"
-            )
-
-        # ====================================================
-        # SHOW MOVEMENT
-        # ====================================================
-
-        unique_cameras = list(
-            dict.fromkeys(
-                event["camera_id"]
-                for event in events
-            )
-        )
-
-        unique_locations = list(
-            dict.fromkeys(
-                event["location"]
-                for event in events
-            )
-        )
-
-        if len(unique_cameras) > 1:
-
-            path = " → ".join(
-                unique_cameras
-            )
-
-            locations = " → ".join(
-                unique_locations
-            )
-
-            trajectory_textbox.insert(
-                "end",
-                f"\nTrajectory: {path}\n"
-            )
-
-            trajectory_textbox.insert(
-                "end",
-                f"Route: {locations}\n"
-            )
-
-            trajectory_textbox.insert(
-                "end",
-                "\nStatus: MULTI-CAMERA VEHICLE\n"
+                "No readable number plates detected.\n"
             )
 
         else:
 
-            trajectory_textbox.insert(
-                "end",
-                "\nTrajectory: "
-                "Single camera observation\n"
+            parts = [
+
+                "CITY-WIDE AI DETECTION RESULTS\n",
+
+                "====================================\n\n"
+            ]
+
+            for index, detection in enumerate(
+                new_detections,
+                start=1
+            ):
+
+                image_name = os.path.basename(
+                    detection["image_path"]
+                )
+
+                parts.append(f"Detection {index}\n")
+
+                parts.append(
+                    f"Plate       : "
+                    f"{detection['plate_number']}\n"
+                )
+
+                parts.append(
+                    f"Confidence  : "
+                    f"{detection['confidence']:.2f}\n"
+                )
+
+                parts.append(
+                    f"Camera      : "
+                    f"{detection['camera_id']}\n"
+                )
+
+                parts.append(
+                    f"Location    : "
+                    f"{detection['location']}\n"
+                )
+
+                parts.append(
+                    f"Timestamp   : "
+                    f"{detection['timestamp']}\n"
+                )
+
+                parts.append(f"Image       : {image_name}\n")
+
+                parts.append(
+                    "------------------------------------\n"
+                )
+
+            self.result_textbox.insert("end", "".join(parts))
+
+        self.update_trajectory_view()
+
+        self.update_statistics()
+
+        self.update_analytics_view()
+
+        if new_detections:
+
+            self.preview_image(
+                new_detections[0]["image_path"]
             )
 
-        trajectory_textbox.insert(
+        self.status_label.configure(
+            text=(
+                f"Processed {source_label} | "
+                f"Detected {len(new_detections)} plate(s) | "
+                f"Saved {saved_count} record(s)"
+            )
+        )
+
+        self.detect_btn.configure(state="normal")
+
+    # ========================================================
+    # RESULT VIEWS
+    # ========================================================
+
+    def show_all_detections(self):
+
+        self.result_textbox.delete("1.0", "end")
+
+        if not self.all_detections:
+
+            self.result_textbox.insert(
+                "end",
+                "No detections available."
+            )
+
+            return
+
+        parts = [
+
+            "ALL DETECTION EVENTS\n",
+
+            "====================================\n\n"
+        ]
+
+        for index, detection in enumerate(
+            self.all_detections,
+            start=1
+        ):
+
+            parts.append(
+                f"{index}. "
+                f"{detection['plate_number']} | "
+                f"{detection['camera_id']} | "
+                f"{detection['location']} | "
+                f"{detection['timestamp']}\n"
+            )
+
+        self.result_textbox.insert("end", "".join(parts))
+
+        self.result_textbox.see("end")
+
+    def show_history(self):
+
+        self.result_textbox.delete("1.0", "end")
+
+        self.result_textbox.insert(
             "end",
-            "------------------------------------\n"
+            "DETECTION HISTORY (vehicle_database.csv)\n"
         )
 
-    trajectory_textbox.see(
-        "end"
-    )
-
-
-# ============================================================
-# SHOW ALL DETECTIONS
-# ============================================================
-
-def show_all_detections():
-
-    result_textbox.delete(
-        "1.0",
-        "end"
-    )
-
-    if not all_detections:
-
-        result_textbox.insert(
+        self.result_textbox.insert(
             "end",
-            "No detections available."
+            "====================================\n\n"
         )
 
-        return
-
-    result_textbox.insert(
-        "end",
-        "ALL DETECTION EVENTS\n"
-    )
-
-    result_textbox.insert(
-        "end",
-        "====================================\n\n"
-    )
-
-    for index, detection in enumerate(
-        all_detections,
-        start=1
-    ):
-
-        result_textbox.insert(
+        self.result_textbox.insert(
             "end",
-            f"{index}. "
-            f"{detection['plate_number']} | "
-            f"{detection['camera_id']} | "
-            f"{detection['location']} | "
-            f"{detection['timestamp']}\n"
+            get_history()
         )
 
-    result_textbox.see(
-        "end"
-    )
+        self.result_textbox.see("end")
 
+    # ========================================================
+    # SESSION CONTROL
+    # ========================================================
 
-# ============================================================
-# SHOW DATABASE HISTORY
-# ============================================================
+    def clear_all_data(self):
 
-def show_history():
+        self.all_detections = []
 
-    result_textbox.delete(
-        "1.0",
-        "end"
-    )
+        self.trajectory_data = defaultdict(list)
 
-    result_textbox.insert(
-        "end",
-        "DETECTION HISTORY (vehicle_database.csv)\n"
-    )
+        self.result_textbox.delete("1.0", "end")
 
-    result_textbox.insert(
-        "end",
-        "====================================\n\n"
-    )
+        self.trajectory_textbox.delete("1.0", "end")
 
-    result_textbox.insert(
-        "end",
-        get_history()
-    )
+        self.analytics_textbox.delete("1.0", "end")
 
-    result_textbox.see(
-        "end"
-    )
-
-
-# ============================================================
-# CLEAR ALL DATA
-# ============================================================
-
-def clear_all_data():
-
-    global all_detections
-    global trajectory_data
-
-    all_detections = []
-
-    trajectory_data = defaultdict(list)
-
-    result_textbox.delete(
-        "1.0",
-        "end"
-    )
-
-    trajectory_textbox.delete(
-        "1.0",
-        "end"
-    )
-
-    analytics_textbox.delete(
-        "1.0",
-        "end"
-    )
-
-    trajectory_textbox.insert(
-        "end",
-        "No vehicle trajectories yet."
-    )
-
-    analytics_textbox.insert(
-        "end",
-        "No traffic analytics available yet.\n\n"
-        "Upload vehicle images and run AI Detection."
-    )
-
-    update_statistics()
-
-    status_label.configure(
-        text="All session data cleared."
-    )
-
-
-# ============================================================
-# OPEN OUTPUT FOLDER
-# ============================================================
-
-def view_output_folder():
-
-    if os.path.exists(OUTPUT_DIR):
-
-        os.startfile(
-            OUTPUT_DIR
+        self.trajectory_textbox.insert(
+            "end",
+            "No vehicle trajectories yet."
         )
 
-    else:
+        self.analytics_textbox.insert(
+            "end",
+            "No traffic analytics available yet.\n\n"
+            "Upload vehicle images and run AI Detection."
+        )
 
-        messagebox.showwarning(
-            "Output Folder",
-            "Output folder not found."
+        self.update_statistics()
+
+        self.status_label.configure(
+            text="All session data cleared."
+        )
+
+    def view_output_folder(self):
+
+        if not os.path.exists(OUTPUT_DIR):
+
+            messagebox.showwarning(
+                "Output Folder",
+                "Output folder not found."
+            )
+
+            return
+
+        try:
+
+            os.startfile(OUTPUT_DIR)
+
+        except OSError as error:
+
+            logger.warning("Could not open output folder: %s", error)
+
+    # ========================================================
+    # STARTUP
+    # ========================================================
+
+    def _check_startup_dependencies(self):
+
+        problems = check_dependencies()
+
+        if not problems:
+
+            return
+
+        for problem in problems:
+
+            logger.warning("Startup: %s", problem)
+
+        self.status_label.configure(
+            text="Startup warning: " + problems[0]
         )
 
 
-# ============================================================
-# HEADER
-# ============================================================
-
-header_frame = ctk.CTkFrame(
-    app,
-    fg_color="transparent"
-)
-
-header_frame.pack(
-    fill="x",
-    padx=25,
-    pady=(20, 5)
-)
-
-
-title = ctk.CTkLabel(
-    header_frame,
-    text=(
-        "🚦 CITY-WIDE AI TRAFFIC ENGINE"
-    ),
-    font=(
-        "Arial",
-        30,
-        "bold"
-    )
-)
-
-title.pack()
-
-
-subtitle = ctk.CTkLabel(
-    header_frame,
-    text=(
-        "Multi-Camera ANPR • Vehicle Trajectory "
-        "Tracking • Urban Traffic Analytics"
-    ),
-    font=(
-        "Arial",
-        15
-    )
-)
-
-subtitle.pack(
-    pady=(5, 0)
-)
-
-
-# ============================================================
-# CAMERA SELECTION
-# ============================================================
-
-camera_frame = ctk.CTkFrame(
-    app
-)
-
-camera_frame.pack(
-    fill="x",
-    padx=25,
-    pady=15
-)
-
-
-camera_title = ctk.CTkLabel(
-    camera_frame,
-    text="📡 Camera / Location",
-    font=(
-        "Arial",
-        17,
-        "bold"
-    )
-)
-
-camera_title.pack(
-    side="left",
-    padx=20,
-    pady=15
-)
-
-
-camera_dropdown = ctk.CTkComboBox(
-    camera_frame,
-    values=list(
-        CAMERAS.keys()
-    ),
-    width=320,
-    height=40,
-    command=update_camera_info
-)
-
-camera_dropdown.set(
-    list(CAMERAS.keys())[0]
-)
-
-camera_dropdown.pack(
-    side="left",
-    padx=10
-)
-
-
-camera_info_label = ctk.CTkLabel(
-    camera_frame,
-    text=(
-        "Camera ID: CAM-01\n"
-        "Location: Suchitra Junction"
-    ),
-    font=(
-        "Arial",
-        14
-    ),
-    justify="left"
-)
-
-camera_info_label.pack(
-    side="left",
-    padx=30
-)
-
-
-# ============================================================
-# STATISTICS CARDS
-# ============================================================
-
-stats_frame = ctk.CTkFrame(
-    app,
-    fg_color="transparent"
-)
-
-stats_frame.pack(
-    fill="x",
-    padx=25,
-    pady=5
-)
-
-
-# ============================================================
-# TOTAL DETECTIONS
-# ============================================================
-
-total_card = ctk.CTkFrame(
-    stats_frame
-)
-
-total_card.pack(
-    side="left",
-    fill="both",
-    expand=True,
-    padx=5
-)
-
-
-ctk.CTkLabel(
-    total_card,
-    text="TOTAL OBSERVATIONS",
-    font=(
-        "Arial",
-        13,
-        "bold"
-    )
-).pack(
-    pady=(12, 3)
-)
-
-
-total_label = ctk.CTkLabel(
-    total_card,
-    text="0",
-    font=(
-        "Arial",
-        25,
-        "bold"
-    )
-)
-
-total_label.pack(
-    pady=(0, 12)
-)
-
-
-# ============================================================
-# UNIQUE VEHICLES
-# ============================================================
-
-unique_card = ctk.CTkFrame(
-    stats_frame
-)
-
-unique_card.pack(
-    side="left",
-    fill="both",
-    expand=True,
-    padx=5
-)
-
-
-ctk.CTkLabel(
-    unique_card,
-    text="UNIQUE VEHICLES",
-    font=(
-        "Arial",
-        13,
-        "bold"
-    )
-).pack(
-    pady=(12, 3)
-)
-
-
-unique_label = ctk.CTkLabel(
-    unique_card,
-    text="0",
-    font=(
-        "Arial",
-        25,
-        "bold"
-    )
-)
-
-unique_label.pack(
-    pady=(0, 12)
-)
-
-
-# ============================================================
-# ACTIVE CAMERAS
-# ============================================================
-
-camera_card = ctk.CTkFrame(
-    stats_frame
-)
-
-camera_card.pack(
-    side="left",
-    fill="both",
-    expand=True,
-    padx=5
-)
-
-
-ctk.CTkLabel(
-    camera_card,
-    text="ACTIVE CAMERAS",
-    font=(
-        "Arial",
-        13,
-        "bold"
-    )
-).pack(
-    pady=(12, 3)
-)
-
-
-camera_count_label = ctk.CTkLabel(
-    camera_card,
-    text="0",
-    font=(
-        "Arial",
-        25,
-        "bold"
-    )
-)
-
-camera_count_label.pack(
-    pady=(0, 12)
-)
-
-
-# ============================================================
-# MULTI-CAMERA TRAJECTORIES
-# ============================================================
-
-trajectory_card = ctk.CTkFrame(
-    stats_frame
-)
-
-trajectory_card.pack(
-    side="left",
-    fill="both",
-    expand=True,
-    padx=5
-)
-
-
-ctk.CTkLabel(
-    trajectory_card,
-    text="MULTI-CAMERA VEHICLES",
-    font=(
-        "Arial",
-        13,
-        "bold"
-    )
-).pack(
-    pady=(12, 3)
-)
-
-
-trajectory_count_label = ctk.CTkLabel(
-    trajectory_card,
-    text="0",
-    font=(
-        "Arial",
-        25,
-        "bold"
-    )
-)
-
-trajectory_count_label.pack(
-    pady=(0, 12)
-)
-
-
-# ============================================================
-# MAIN CONTENT
-# ============================================================
-
-main_frame = ctk.CTkFrame(
-    app
-)
-
-main_frame.pack(
-    fill="both",
-    expand=True,
-    padx=25,
-    pady=15
-)
-
-
-# ============================================================
-# LEFT PANEL
-# ============================================================
-
-left_frame = ctk.CTkFrame(
-    main_frame,
-    width=350
-)
-
-left_frame.pack(
-    side="left",
-    fill="y",
-    padx=(15, 10),
-    pady=15
-)
-
-left_frame.pack_propagate(
-    False
-)
-
-
-# ============================================================
-# UPLOAD SINGLE
-# ============================================================
-
-upload_btn = ctk.CTkButton(
-    left_frame,
-    text="📷 Upload Image",
-    width=280,
-    height=45,
-    command=upload_image
-)
-
-upload_btn.pack(
-    pady=(25, 10)
-)
-
-
-# ============================================================
-# UPLOAD MULTIPLE
-# ============================================================
-
-multi_upload_btn = ctk.CTkButton(
-    left_frame,
-    text="📂 Upload Multiple Images",
-    width=280,
-    height=45,
-    command=upload_multiple_images
-)
-
-multi_upload_btn.pack(
-    pady=10
-)
-
-
-# ============================================================
-# UPLOAD VIDEO
-# ============================================================
-
-video_btn = ctk.CTkButton(
-    left_frame,
-    text="🎬 Upload Video",
-    width=280,
-    height=45,
-    command=upload_video
-)
-
-video_btn.pack(
-    pady=10
-)
-
-
-# ============================================================
-# DETECT
-# ============================================================
-
-detect_btn = ctk.CTkButton(
-    left_frame,
-    text="🤖 Run AI Detection",
-    width=280,
-    height=50,
-    command=detect_plate
-)
-
-detect_btn.pack(
-    pady=20
-)
-
-
-# ============================================================
-# CLEAR SELECTION
-# ============================================================
-
-clear_btn = ctk.CTkButton(
-    left_frame,
-    text="Clear Selection",
-    width=280,
-    height=40,
-    command=clear_selection
-)
-
-clear_btn.pack(
-    pady=5
-)
-
-
-# ============================================================
-# SELECTED IMAGES
-# ============================================================
-
-selected_files_label = ctk.CTkLabel(
-    left_frame,
-    text="Selected Images: 0",
-    font=(
-        "Arial",
-        13
-    ),
-    wraplength=280
-)
-
-selected_files_label.pack(
-    pady=20
-)
-
-
-# ============================================================
-# STATUS
-# ============================================================
-
-status_label = ctk.CTkLabel(
-    left_frame,
-    text="Ready.",
-    font=(
-        "Arial",
-        13
-    ),
-    wraplength=280
-)
-
-status_label.pack(
-    pady=10
-)
-
-
-# ============================================================
-# OPEN OUTPUT
-# ============================================================
-
-output_btn = ctk.CTkButton(
-    left_frame,
-    text="📁 Open Output Folder",
-    width=280,
-    height=40,
-    command=view_output_folder
-)
-
-output_btn.pack(
-    pady=10
-)
-
-
-# ============================================================
-# SHOW ALL
-# ============================================================
-
-show_all_btn = ctk.CTkButton(
-    left_frame,
-    text="View All Detection Events",
-    width=280,
-    height=40,
-    command=show_all_detections
-)
-
-show_all_btn.pack(
-    pady=10
-)
-
-
-# ============================================================
-# VIEW DATABASE HISTORY
-# ============================================================
-
-history_btn = ctk.CTkButton(
-    left_frame,
-    text="🗄️ View Detection History",
-    width=280,
-    height=40,
-    command=show_history
-)
-
-history_btn.pack(
-    pady=10
-)
-
-
-# ============================================================
-# CLEAR SESSION
-# ============================================================
-
-clear_all_btn = ctk.CTkButton(
-    left_frame,
-    text="Clear Session Data",
-    width=280,
-    height=40,
-    command=clear_all_data
-)
-
-clear_all_btn.pack(
-    pady=10
-)
-
-
-# ============================================================
-# RIGHT PANEL
-# SCROLLABLE DASHBOARD
-# ============================================================
-
-right_frame = ctk.CTkScrollableFrame(
-    main_frame
-)
-
-right_frame.pack(
-    side="right",
-    fill="both",
-    expand=True,
-    padx=(10, 15),
-    pady=15
-)
-
-
-# ============================================================
-# IMAGE PREVIEW
-# ============================================================
-
-preview_title = ctk.CTkLabel(
-    right_frame,
-    text="Vehicle Image",
-    font=(
-        "Arial",
-        18,
-        "bold"
-    )
-)
-
-preview_title.pack(
-    pady=(10, 5)
-)
-
-
-image_label = ctk.CTkLabel(
-    right_frame,
-    text="Image Preview Area",
-    font=(
-        "Arial",
-        20
-    ),
-    height=300
-)
-
-image_label.pack(
-    fill="x",
-    padx=20,
-    pady=10
-)
-
-
-# ============================================================
-# RESULT AREA
-# ============================================================
-
-result_title = ctk.CTkLabel(
-    right_frame,
-    text="Detection Results",
-    font=(
-        "Arial",
-        17,
-        "bold"
-    )
-)
-
-result_title.pack(
-    pady=(5, 5)
-)
-
-
-result_textbox = ctk.CTkTextbox(
-    right_frame,
-    height=170,
-    wrap="word",
-    font=(
-        "Consolas",
-        13
-    )
-)
-
-result_textbox.pack(
-    fill="x",
-    padx=20,
-    pady=5
-)
-
-
-# ============================================================
-# TRAJECTORY AREA
-# ============================================================
-
-trajectory_title = ctk.CTkLabel(
-    right_frame,
-    text="🚗 Multi-Camera Vehicle Trajectory",
-    font=(
-        "Arial",
-        17,
-        "bold"
-    )
-)
-
-trajectory_title.pack(
-    pady=(15, 5)
-)
-
-
-trajectory_textbox = ctk.CTkTextbox(
-    right_frame,
-    height=230,
-    wrap="word",
-    font=(
-        "Consolas",
-        13
-    )
-)
-
-trajectory_textbox.pack(
-    fill="x",
-    padx=20,
-    pady=(5, 20)
-)
-
-
-trajectory_textbox.insert(
-    "end",
-    "No vehicle trajectories yet."
-)
-
-
-# ============================================================
-# URBAN TRAFFIC ANALYTICS
-# ============================================================
-
-analytics_title = ctk.CTkLabel(
-    right_frame,
-    text="🚦 Urban Traffic Analytics",
-    font=(
-        "Arial",
-        18,
-        "bold"
-    )
-)
-
-analytics_title.pack(
-    pady=(5, 5)
-)
-
-
-analytics_textbox = ctk.CTkTextbox(
-    right_frame,
-    height=420,
-    wrap="word",
-    font=(
-        "Consolas",
-        13
-    )
-)
-
-analytics_textbox.pack(
-    fill="x",
-    padx=20,
-    pady=(5, 20)
-)
-
-
-analytics_textbox.insert(
-    "end",
-    "No traffic analytics available yet.\n\n"
-    "Upload vehicle images and run AI Detection."
-)
-
-
-# ============================================================
-# SYSTEM INFORMATION
-# ============================================================
-
-info_title = ctk.CTkLabel(
-    right_frame,
-    text="System Information",
-    font=(
-        "Arial",
-        17,
-        "bold"
-    )
-)
-
-info_title.pack(
-    pady=(5, 5)
-)
-
-
-info_textbox = ctk.CTkTextbox(
-    right_frame,
-    height=150,
-    wrap="word",
-    font=(
-        "Consolas",
-        12
-    )
-)
-
-info_textbox.pack(
-    fill="x",
-    padx=20,
-    pady=(5, 20)
-)
-
-
-info_textbox.insert(
-    "end",
-    "CITY-WIDE AI TRAFFIC ENGINE\n"
-    "--------------------------------------------\n"
-    "AI Engine        : YOLOv8 + Tesseract OCR\n"
-    "Input Mode       : Image + Video Upload\n"
-    "Video Mode       : Frame Sampling + Temporal Voting\n"
-    "Vehicle Identity : License Plate Number\n"
-    "Camera Mode      : Multi-Camera Simulation\n"
-    "Association       : Cross-Camera ANPR\n"
-    "Trajectory        : Camera Route Reconstruction\n"
-    "Analytics         : Session-Based Traffic Activity\n"
-    "Database          : vehicle_database.csv (persistent)\n"
-    "Processing        : Background Thread\n"
-    "\n"
-    "Current Prototype:\n"
-    "Individual vehicle images are assigned to "
-    "simulated camera locations to demonstrate "
-    "city-wide ANPR, vehicle association, routes "
-    "and traffic activity analytics.\n"
-)
-
-
-# ============================================================
-# START APPLICATION
-# ============================================================
-
-update_camera_info()
-
-update_statistics()
-
-update_analytics_view()
-
-
-# ============================================================
-# STARTUP DEPENDENCY CHECK
-# ============================================================
-
-problems = check_dependencies()
-
-if problems:
-
-    print("\nSTARTUP WARNINGS:")
-
-    for problem in problems:
-
-        print(" -", problem)
-
-    status_label.configure(
-        text="Startup warning: " + problems[0]
+def main():
+
+    logging.basicConfig(
+        level=getattr(logging, LOG_LEVEL, logging.INFO),
+        format="%(asctime)s %(levelname)-7s %(name)s: %(message)s"
     )
 
+    os.makedirs(OUTPUT_DIR, exist_ok=True)
 
-# ============================================================
-# START RESULT POLLING + APPLICATION
-# ============================================================
+    ANPRApp().run()
 
-app.after(
-    200,
-    poll_results
-)
 
-app.mainloop()
+if __name__ == "__main__":
+
+    main()

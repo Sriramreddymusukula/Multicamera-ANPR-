@@ -66,6 +66,23 @@ VIDEO_SINGLE_HIT_CONF = 0.70
 # File dialog filter for video uploads.
 VIDEO_FILE_TYPES = "*.mp4 *.avi *.mkv *.mov *.webm *.ogv"
 
+# File dialog filter for image uploads.
+IMAGE_FILE_TYPES = "*.jpg *.jpeg *.png *.bmp"
+
+# JPEG quality used when compressing video evidence frames.
+EVIDENCE_JPEG_QUALITY = 88
+
+
+# ============================================================
+# LOGGING
+# ============================================================
+
+# Application log level (DEBUG / INFO / WARNING / ERROR).
+LOG_LEVEL = os.environ.get(
+    "ANPR_LOG_LEVEL",
+    "INFO"
+).upper()
+
 
 # ============================================================
 # TESSERACT OCR DISCOVERY
@@ -125,4 +142,10 @@ CAMERAS = {
         "id": "CAM-04",
         "location": "Miyapur"
     }
+}
+
+# Fast camera-id -> location lookup used by analytics views.
+CAMERA_LOCATION_BY_ID = {
+    camera["id"]: camera["location"]
+    for camera in CAMERAS.values()
 }

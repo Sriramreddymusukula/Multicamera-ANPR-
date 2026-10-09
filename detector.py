@@ -1,9 +1,23 @@
-from ultralytics import YOLO
+"""
+License plate detection pipeline.
+
+YOLOv8 locates plates in an image or video frame, each crop is
+refined and binarized into several OCR variants, and Tesseract
+results are mined for structurally valid Indian plate candidates
+that are scored and deduplicated.
+
+Heavy dependencies (ultralytics/torch) are imported lazily so
+importing this module and unit-testing the text logic stays cheap.
+"""
+
+import importlib.util
+import logging
+import os
+import threading
+import uuid
+
 import cv2
 import pytesseract
-import re
-import os
-import uuid
 
 from config import (
     MODEL_PATH,
@@ -16,6 +30,15 @@ from config import (
     PADDING_Y,
     find_tesseract
 )
+from plate_cleaning import (
+    clean_plate_text,
+    find_plate_candidates,
+    fix_plate_characters,
+    normalize_text as _normalize_text,
+    snap_state_code
+)
+
+logger = logging.getLogger(__name__)
 
 
 # ============================================================
@@ -32,10 +55,12 @@ if _tesseract_cmd:
 
 
 # ============================================================
-# LAZY YOLO MODEL LOADING
+# LAZY YOLO MODEL LOADING (THREAD-SAFE)
 # ============================================================
 
 _model = None
+
+_model_lock = threading.Lock()
 
 
 def get_model():
@@ -51,9 +76,15 @@ def get_model():
                 f"YOLO model not found: {MODEL_PATH}"
             )
 
-        print("Loading YOLO model:", MODEL_PATH)
+        with _model_lock:
 
-        _model = YOLO(MODEL_PATH)
+            if _model is None:
+
+                from ultralytics import YOLO
+
+                logger.info("Loading YOLO model: %s", MODEL_PATH)
+
+                _model = YOLO(MODEL_PATH)
 
     return _model
 
@@ -76,134 +107,28 @@ def check_dependencies():
             "its path to TESSERACT_CANDIDATES in config.py"
         )
 
+    try:
+
+        if importlib.util.find_spec("ultralytics") is None:
+
+            problems.append(
+                "Ultralytics package not installed. Run: "
+                "pip install -r requirements.txt"
+            )
+
+    except (ImportError, ValueError):
+
+        problems.append(
+            "Ultralytics package not importable. Run: "
+            "pip install -r requirements.txt"
+        )
+
     return problems
 
 
-# ============================================================
-# CREATE OUTPUT DIRECTORY
-# ============================================================
+def _ensure_output_dir():
 
-os.makedirs(OUTPUT_DIR, exist_ok=True)
-
-
-# ============================================================
-# OCR TEXT CLEANING (POSITION-AWARE)
-# ============================================================
-
-# Letters and digits that OCR commonly confuses.
-DIGIT_TO_LETTER = {
-    "0": "O",
-    "1": "I",
-    "2": "Z",
-    "5": "S",
-    "6": "G",
-    "8": "B"
-}
-
-LETTER_TO_DIGIT = {
-    "O": "0",
-    "Q": "0",
-    "D": "0",
-    "I": "1",
-    "L": "1",
-    "Z": "2",
-    "S": "5",
-    "G": "6",
-    "B": "8"
-}
-
-
-def fix_plate_characters(plate_text):
-    """
-    Position-aware corrections for the Indian plate format
-    SS-DD-LL(L)-NNNN:
-
-        positions 0-1    : state code  -> letters
-        positions 2-3    : district    -> digits
-        middle positions : series      -> letters
-        last 4 positions : serial      -> digits
-
-    Texts with an unexpected length are returned unchanged.
-    """
-
-    if not 8 <= len(plate_text) <= 10:
-
-        return plate_text
-
-    chars = list(plate_text)
-
-    n = len(chars)
-
-    for index in range(0, 2):
-
-        chars[index] = DIGIT_TO_LETTER.get(
-            chars[index],
-            chars[index]
-        )
-
-    for index in range(2, 4):
-
-        chars[index] = LETTER_TO_DIGIT.get(
-            chars[index],
-            chars[index]
-        )
-
-    for index in range(n - 4, n):
-
-        chars[index] = LETTER_TO_DIGIT.get(
-            chars[index],
-            chars[index]
-        )
-
-    for index in range(4, n - 4):
-
-        chars[index] = DIGIT_TO_LETTER.get(
-            chars[index],
-            chars[index]
-        )
-
-    return "".join(chars)
-
-
-def _normalize_text(text):
-    """Uppercase, keep alphanumerics, strip noise and IND strip."""
-
-    plate_text = text.upper()
-
-    plate_text = re.sub(
-        r"[^A-Z0-9]",
-        "",
-        plate_text
-    )
-
-    # --------------------------------------------------------
-    # Remove the "IND" hologram text printed on Indian plates
-    # --------------------------------------------------------
-
-    if len(plate_text) > 10 and plate_text[0] == "1":
-
-        plate_text = "I" + plate_text[1:]
-
-    if (
-        plate_text.startswith("IND")
-        and len(plate_text) - 3 >= 8
-    ):
-
-        plate_text = plate_text[3:]
-
-    return plate_text
-
-
-def clean_plate_text(text):
-    """
-    Clean and normalize OCR output into an alphanumeric
-    registration identifier, then apply position-aware
-    character corrections.
-    """
-
-    return fix_plate_characters(
-        _normalize_text(text)
-    )
+    os.makedirs(OUTPUT_DIR, exist_ok=True)
 
 
 def _remove_artifact(path):
@@ -217,7 +142,7 @@ def _remove_artifact(path):
 
     except OSError as error:
 
-        print("Could not remove artifact:", path, error)
+        logger.warning("Could not remove artifact %s: %s", path, error)
 
 
 def _remove_artifacts(detection):
@@ -358,12 +283,32 @@ def _enhanced_gray(plate, scale=10):
     )
 
 
-def preprocess_plate(plate):
+def _prepare_grays(plate):
+    """
+    Compute the shared preprocessing once per plate crop.
+
+    Returns (gray, gray_soft) where gray is the default enlarged
+    denoised image and gray_soft uses a gentler rescale. Both are
+    reused by preprocess_plate() and all OCR variants so each
+    crop is refined and filtered exactly once.
+    """
+
+    refined = _refine_plate_crop(plate)
+
+    return (
+        _enhanced_gray(refined),
+        _enhanced_gray(refined, scale=6)
+    )
+
+
+def preprocess_plate(plate, prepared=None):
     """Convert a plate crop into a clean binary image for OCR."""
 
-    gray = _enhanced_gray(
-        _refine_plate_crop(plate)
-    )
+    if prepared is None:
+
+        prepared = _prepare_grays(plate)
+
+    gray = prepared[0]
 
     _, thresh = cv2.threshold(
         gray,
@@ -376,183 +321,17 @@ def preprocess_plate(plate):
 
 
 # ============================================================
-# MULTI-VARIANT OCR + INDIAN PLATE CANDIDATE SCORING
+# MULTI-VARIANT OCR
 # ============================================================
 
-# Valid state / union territory codes on Indian plates.
-STATE_CODES = {
-    "AN", "AP", "AR", "AS", "BR", "CG", "CH", "DD", "DL", "DN",
-    "GA", "GJ", "HP", "HR", "JH", "JK", "KA", "KL", "LA", "LD",
-    "MH", "ML", "MN", "MP", "MZ", "NL", "OD", "PB", "PY", "RJ",
-    "SK", "TG", "TN", "TR", "TS", "UK", "UP", "UT", "WB"
-}
-
-# Common OCR confusions, used ONLY to snap a state code to a
-# valid one when it is within a single character.
-STATE_CODE_CONFUSIONS = {
-    "O": "DQ0U", "Q": "O0", "D": "O0", "0": "ODQ",
-    "I": "L1T", "L": "I1T", "1": "IL",
-    "S": "58", "5": "S",
-    "B": "8RP", "8": "B",
-    "Z": "2", "2": "Z",
-    "G": "6C", "6": "G",
-    "T": "7I", "7": "T",
-    "C": "G", "U": "O", "V": "U",
-    "K": "X", "X": "K",
-    "N": "M", "M": "N",
-    "R": "B", "P": "B",
-    "J": "I", "E": "F", "F": "E", "H": "N",
-    "A": "4", "4": "A"
-}
-
-
-def snap_state_code(code):
-    """Snap a 2-letter code to a valid state code within one confusion."""
-
-    if code in STATE_CODES:
-
-        return code
-
-    for position in (0, 1):
-
-        for replacement in STATE_CODE_CONFUSIONS.get(code[position], ""):
-
-            candidate = (
-                code[:position]
-                + replacement
-                + code[position + 1:]
-            )
-
-            if candidate in STATE_CODES:
-
-                return candidate
-
-    return code
-
-
-def _count_changes(before, after):
-    """Number of differing characters between two strings."""
-
-    return sum(
-        1 for first, second in zip(before, after)
-        if first != second
-    )
-
-
-def find_plate_candidates(cleaned_text):
-    """
-    Yield (plate, score) candidates mined from one OCR text.
-
-    Every 8-10 character window is corrected, its state code is
-    snapped to a valid one, and it is scored on Indian-plate
-    structure. Candidates are penalized for characters that had
-    to be corrected and for surrounding text the window does not
-    explain, so a clean full match beats a noisy fragment.
-
-    The 4-digit serial ending is required for corrected reads,
-    while verbatim reads (no corrections at all) may end with a
-    letter series such as  MH02TCC43A. Bharat (BH) series plates
-    are recognised directly.
-    """
-
-    cleaned_text = _normalize_text(cleaned_text)
-
-    text_length = len(cleaned_text)
-
-    # --------------------------------------------------------
-    # Bharat (BH) series:  YY BH NNNN LL
-    # --------------------------------------------------------
-
-    for match in re.finditer(
-        r"[0-9]{2}BH[0-9]{4}[A-Z]{1,2}",
-        cleaned_text
-    ):
-
-        yield match.group(0), 10
-
-    # --------------------------------------------------------
-    # Classic format windows
-    # --------------------------------------------------------
-
-    for length in (10, 9, 8):
-
-        if text_length < length:
-
-            continue
-
-        for start in range(0, text_length - length + 1):
-
-            window = cleaned_text[start:start + length]
-
-            fixed = fix_plate_characters(window)
-
-            state = snap_state_code(fixed[:2])
-
-            if state not in STATE_CODES:
-
-                continue
-
-            plate = state + fixed[2:]
-
-            corrections = _count_changes(window, fixed)
-
-            corrections += _count_changes(fixed[:2], plate[:2])
-
-            unexplained = text_length - length
-
-            digits_in_serial = sum(
-                char.isdigit() for char in plate[-4:]
-            )
-
-            if digits_in_serial == 4:
-
-                base = 7
-
-            elif digits_in_serial == 3:
-
-                base = 5
-
-            elif (
-                digits_in_serial == 2
-                and corrections == 0
-                and unexplained <= 2
-            ):
-
-                # Verbatim read with a trailing letter series
-                # (a little OCR noise around it is tolerated).
-                base = 4
-
-            else:
-
-                continue
-
-            score = base + 1
-
-            middle = plate[2:-4]
-
-            if any(char.isalpha() for char in middle):
-
-                score += 1
-
-            if any(char.isdigit() for char in middle):
-
-                score += 1
-
-            score -= corrections
-
-            score -= unexplained
-
-            yield plate, score
-
-
-def _build_ocr_variants(plate):
+def _build_ocr_variants(plate, prepared=None):
     """Build binarization variants used for multi-pass OCR."""
 
-    refined = _refine_plate_crop(plate)
+    if prepared is None:
 
-    gray = _enhanced_gray(refined)
+        prepared = _prepare_grays(plate)
 
-    gray_soft = _enhanced_gray(refined, scale=6)
+    gray, gray_soft = prepared
 
     _, fixed_150 = cv2.threshold(
         gray,
@@ -615,7 +394,7 @@ def _tesseract_read(image, config):
 
     except Exception as error:
 
-        print("OCR error:", error)
+        logger.debug("OCR error: %s", error)
 
         return "", 0.0
 
@@ -649,7 +428,7 @@ def _tesseract_read(image, config):
     return text, mean_confidence
 
 
-def ocr_plate_text(plate):
+def ocr_plate_text(plate, prepared=None):
     """
     Multi-variant OCR + Indian plate candidate scoring.
 
@@ -667,7 +446,7 @@ def ocr_plate_text(plate):
 
     raw_texts = []
 
-    for name, image, config in _build_ocr_variants(plate):
+    for name, image, config in _build_ocr_variants(plate, prepared):
 
         text, confidence = _tesseract_read(image, config)
 
@@ -732,13 +511,15 @@ def ocr_plate_text(plate):
 # DETECT ALL NUMBER PLATES
 # ============================================================
 
-def detect_number_plates(image, save_artifacts=True):
+def detect_number_plates(image, save_artifacts=True, verbose=True):
     """
     Detect all readable number plates in an image or video frame.
 
     Parameters:
         image          : file path (str) or OpenCV BGR frame
         save_artifacts : write crop/preprocessed images into output/
+        verbose        : log per-detection progress at INFO level;
+                         when False, details drop to DEBUG level
 
     Returns a list of dictionaries, each containing:
 
@@ -749,6 +530,8 @@ def detect_number_plates(image, save_artifacts=True):
         preprocessed_plate
         plate_image
     """
+
+    log = logger.info if verbose else logger.debug
 
     if isinstance(image, str):
 
@@ -764,15 +547,11 @@ def detect_number_plates(image, save_artifacts=True):
 
     if img is None:
 
-        print("ERROR: Could not read image:", source)
+        logger.error("Could not read image: %s", source)
 
         return []
 
-    print("\n========================================")
-    print("CITY ANPR - IMAGE PROCESSING")
-    print("========================================")
-
-    print("Image:", source)
+    log("ANPR image processing: %s", source)
 
     try:
 
@@ -780,7 +559,7 @@ def detect_number_plates(image, save_artifacts=True):
 
     except Exception as error:
 
-        print("ERROR: Could not load YOLO model:", error)
+        logger.error("Could not load YOLO model: %s", error)
 
         return []
 
@@ -800,6 +579,10 @@ def detect_number_plates(image, save_artifacts=True):
     # Unique ID for output files
     image_id = uuid.uuid4().hex[:8]
 
+    if save_artifacts:
+
+        _ensure_output_dir()
+
     # --------------------------------------------------------
     # PROCESS YOLO RESULTS
     # --------------------------------------------------------
@@ -808,7 +591,7 @@ def detect_number_plates(image, save_artifacts=True):
 
         boxes = result.boxes
 
-        print("Boxes found:", len(boxes))
+        log("Boxes found: %d", len(boxes))
 
         for index, box in enumerate(boxes):
 
@@ -821,9 +604,10 @@ def detect_number_plates(image, save_artifacts=True):
                 box.xyxy[0]
             )
 
-            print(
-                f"Plate {index + 1} "
-                f"confidence: {confidence:.3f}"
+            log(
+                "Plate %d confidence: %.3f",
+                index + 1,
+                confidence
             )
 
             # ------------------------------------------------
@@ -835,9 +619,10 @@ def detect_number_plates(image, save_artifacts=True):
                 or y2 - y1 < MIN_PLATE_HEIGHT
             ):
 
-                print(
-                    "Skipped small detection: "
-                    f"{x2 - x1}x{y2 - y1}"
+                log(
+                    "Skipped small detection: %dx%d",
+                    x2 - x1,
+                    y2 - y1
                 )
 
                 continue
@@ -859,9 +644,15 @@ def detect_number_plates(image, save_artifacts=True):
 
             if plate.size == 0:
 
-                print("Invalid plate crop.")
+                log("Invalid plate crop.")
 
                 continue
+
+            # ------------------------------------------------
+            # SHARED PREPROCESSING (COMPUTED ONCE)
+            # ------------------------------------------------
+
+            prepared = _prepare_grays(plate)
 
             # ------------------------------------------------
             # SAVE CROPPED PLATE (OPTIONAL)
@@ -878,11 +669,7 @@ def detect_number_plates(image, save_artifacts=True):
 
                 cv2.imwrite(crop_path, plate)
 
-            # ------------------------------------------------
-            # PREPROCESS FOR OCR
-            # ------------------------------------------------
-
-            thresh = preprocess_plate(plate)
+            thresh = preprocess_plate(plate, prepared)
 
             preprocess_path = None
 
@@ -899,17 +686,17 @@ def detect_number_plates(image, save_artifacts=True):
             # TESSERACT OCR (MULTI-VARIANT + CANDIDATE SCORING)
             # ------------------------------------------------
 
-            plate_text, raw_texts = ocr_plate_text(plate)
+            plate_text, raw_texts = ocr_plate_text(plate, prepared)
 
             for raw_text in raw_texts:
 
-                print("OCR Pass:", raw_text)
+                logger.debug("OCR pass: %s", raw_text)
 
-            print("Final Plate:", plate_text)
+            log("Final plate: %r", plate_text)
 
             if len(plate_text) < 4:
 
-                print(
+                log(
                     "OCR failed - dropping detection "
                     "and removing artifacts."
                 )
@@ -957,18 +744,14 @@ def detect_number_plates(image, save_artifacts=True):
 
     if not detections:
 
-        print("NO READABLE NUMBER PLATE DETECTED.")
+        log("No readable number plate detected.")
 
     else:
 
-        print(
-            f"Total detections: "
-            f"{len(detections)}"
+        log(
+            "Total detections: %d",
+            len(detections)
         )
-
-    print(
-        "========================================\n"
-    )
 
     return detections
 
