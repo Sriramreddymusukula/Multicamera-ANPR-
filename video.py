@@ -17,6 +17,7 @@ import uuid
 from datetime import datetime
 
 import cv2
+import numpy as np
 
 from config import (
     EVIDENCE_JPEG_QUALITY,
@@ -192,12 +193,16 @@ def _update_group(groups, detection, frame, frame_index, seconds):
         group = {
             "hits": 0,
             "best_confidence": 0.0,
-            "first_frame": frame_index
+            "first_frame": frame_index,
+            "sightings": [],
+            "votes": {plate: 0},
         }
 
         groups[plate] = group
 
     group["hits"] += 1
+    group["votes"][plate] += 1
+    group["sightings"].append((seconds, detection["bbox"]))
 
     group["last_frame"] = frame_index
 
@@ -231,7 +236,7 @@ def _finalize_groups(groups):
 
     accepted = []
 
-    for plate, group in groups.items():
+    for plate, group in _merge_related_groups(groups):
 
         if (
             group["hits"] < VIDEO_MIN_HITS
@@ -248,6 +253,7 @@ def _finalize_groups(groups):
             continue
 
         detection = dict(group["best_detection"])
+        detection["plate_number"] = plate
 
         frame_path, crop_path, pre_path = _save_evidence(
             plate,
@@ -261,6 +267,9 @@ def _finalize_groups(groups):
         detection["image_path"] = frame_path or crop_path
 
         detection["hits"] = group["hits"]
+        detection["alternatives"] = group.get("alternatives", [plate])
+        detection["match_confidence"] = group.get("match_confidence", 1.0)
+        detection["review_reasons"] = group.get("review_reasons", [])
 
         detection["video_time"] = round(
             group.get("best_time", 0.0),
@@ -268,6 +277,7 @@ def _finalize_groups(groups):
         )
 
         detection.pop("plate_image", None)
+        detection.pop("raw_plate_image", None)
 
         accepted.append(detection)
 
@@ -276,6 +286,125 @@ def _finalize_groups(groups):
     )
 
     return accepted
+
+
+def _plate_distance(left, right):
+    """Count differing characters for equally sized registration reads."""
+    if len(left) != len(right):
+        return 99
+    return sum(a != b for a, b in zip(left, right))
+
+
+def _same_vehicle(left_plate, left, right_plate, right):
+    """Require compatible text and nearby frame locations before merging."""
+    if left_plate[:6] != right_plate[:6]:
+        return False
+    if _plate_distance(left_plate, right_plate) > 2:
+        return False
+
+    for left_time, left_box in left["sightings"]:
+        for right_time, right_box in right["sightings"]:
+            if abs(left_time - right_time) > 1.5:
+                continue
+            lx = (left_box[0] + left_box[2]) / 2
+            ly = (left_box[1] + left_box[3]) / 2
+            rx = (right_box[0] + right_box[2]) / 2
+            ry = (right_box[1] + right_box[3]) / 2
+            width = max(
+                left_box[2] - left_box[0],
+                right_box[2] - right_box[0],
+            )
+            height = max(
+                left_box[3] - left_box[1],
+                right_box[3] - right_box[1],
+            )
+            if abs(lx - rx) <= max(100, width * 2) and abs(ly - ry) <= max(60, height * 2):
+                return True
+    return False
+
+
+def _merge_related_groups(groups):
+    """Combine adjacent OCR variants of one observed vehicle."""
+    merged = []
+    for plate, group in sorted(
+        groups.items(), key=lambda item: item[1]["first_frame"]
+    ):
+        target = next(
+            (
+                item for item in merged
+                if any(
+                    _same_vehicle(plate, group, member_plate, member)
+                    for member_plate, member in item["members"]
+                )
+            ),
+            None,
+        )
+        if target is None:
+            merged.append({"members": [(plate, group)]})
+        else:
+            target["members"].append((plate, group))
+
+    results = []
+    for item in merged:
+        members = item["members"]
+        best_plate, best = max(
+            members,
+            key=lambda pair: (pair[1]["best_confidence"], pair[1]["hits"]),
+        )
+        votes = {plate: group["hits"] for plate, group in members}
+        # Reread one evidence crop from *each* text variant. The most
+        # confident YOLO box is not necessarily the most legible frame.
+        # JPEG compression can also make a fine stroke readable again.
+        from detector import ocr_plate_text
+        rereads = {}
+        for member_plate, member in members if len(members) > 1 else []:
+            padded = member["best_detection"].get("plate_image")
+            if padded is None or not padded.size:
+                continue
+            reread, _, confidence = ocr_plate_text(
+                padded, return_confidence=True
+            )
+            if not reread:
+                jpeg = _encode_jpeg(padded)
+                crop = cv2.imdecode(
+                    np.frombuffer(jpeg, dtype=np.uint8),
+                    cv2.IMREAD_COLOR,
+                ) if jpeg else padded
+                reread, _, confidence = ocr_plate_text(
+                    crop, return_confidence=True
+                )
+            if reread and any(
+                _plate_distance(reread, plate) <= 2 for plate in votes
+            ):
+                rereads[reread] = max(
+                    rereads.get(reread, (0.0, None)),
+                    (confidence, member_plate),
+                )
+                votes[reread] = votes.get(reread, 0) + 2
+        canonical = max(
+            votes,
+            key=lambda value: (
+                votes[value],
+                rereads.get(value, (0.0, None))[0],
+                value == best_plate,
+            ),
+        )
+        if canonical in rereads:
+            source_plate = rereads[canonical][1]
+            best = next(group for plate, group in members if plate == source_plate)
+        combined = dict(best)
+        combined["hits"] = sum(group["hits"] for _, group in members)
+        combined["first_frame"] = min(
+            group["first_frame"] for _, group in members
+        )
+        combined["alternatives"] = sorted(votes, key=votes.get, reverse=True)
+        combined["match_confidence"] = round(
+            max(group["hits"] for _, group in members) / combined["hits"], 4
+        )
+        if len(members) > 1:
+            combined["review_reasons"] = ["Conflicting plate reads across video frames"]
+        results.append((canonical, combined))
+    return results
 
 
 def _save_evidence(plate, group):

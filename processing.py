@@ -8,8 +8,12 @@ has one canonical shape.
 """
 
 import logging
+import shutil
+import uuid
 from datetime import datetime
+from pathlib import Path
 
+from config import OUTPUT_DIR
 from database import save_detections
 from detector import detect_number_plates
 from video import analyze_video
@@ -19,7 +23,7 @@ logger = logging.getLogger(__name__)
 
 def build_detection_record(detection, camera, timestamp, image_path):
 
-    return {
+    record = {
 
         "plate_number": detection["plate_number"],
 
@@ -39,6 +43,10 @@ def build_detection_record(detection, camera, timestamp, image_path):
 
         "preprocessed_plate": detection["preprocessed_plate"]
     }
+    for key in ("ocr_confidence", "match_confidence", "alternatives", "review_reasons", "hits", "video_time"):
+        if key in detection:
+            record[key] = detection[key]
+    return record
 
 
 def _persist(detections):
@@ -59,14 +67,14 @@ def _persist(detections):
         return 0
 
 
-def process_images(image_paths, camera, should_cancel=None):
+def process_images(image_paths, camera, should_cancel=None, retain_sources=False, source_names=None, persist=True):
     """Run detection over uploaded images and persist the results."""
 
     new_detections = []
 
     processed_count = 0
 
-    for image_path in image_paths:
+    for index, image_path in enumerate(image_paths):
 
         if should_cancel and should_cancel():
 
@@ -98,6 +106,15 @@ def process_images(image_paths, camera, should_cancel=None):
             "%Y-%m-%d %H:%M:%S"
         )
 
+        evidence_path = image_path
+        if detections and retain_sources:
+            output = Path(OUTPUT_DIR)
+            output.mkdir(parents=True, exist_ok=True)
+            evidence_path = str(
+                output / f"image_frame_{uuid.uuid4().hex}{Path(image_path).suffix.lower()}"
+            )
+            shutil.copy2(image_path, evidence_path)
+
         for detection in detections:
 
             new_detections.append(
@@ -105,14 +122,16 @@ def process_images(image_paths, camera, should_cancel=None):
                     detection,
                     camera,
                     timestamp,
-                    image_path
+                    evidence_path
                 )
             )
+            if source_names:
+                new_detections[-1]["source_name"] = source_names[index]
 
     return {
         "detections": new_detections,
         "source_label": f"{processed_count} image(s)",
-        "saved_count": _persist(new_detections)
+        "saved_count": _persist(new_detections) if persist else 0
     }
 
 
@@ -120,7 +139,8 @@ def process_video(
     video_path,
     camera,
     progress_callback=None,
-    should_cancel=None
+    should_cancel=None,
+    persist=True,
 ):
     """Analyze a video file and persist one record per vehicle."""
 
@@ -163,5 +183,5 @@ def process_video(
     return {
         "detections": new_detections,
         "source_label": source_label,
-        "saved_count": _persist(new_detections)
+        "saved_count": _persist(new_detections) if persist else 0
     }

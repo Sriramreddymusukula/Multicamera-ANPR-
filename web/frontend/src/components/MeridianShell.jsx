@@ -54,6 +54,7 @@ export function MeridianShell({ children }) {
         </a>
         <nav className={'meridian-nav__links' + (open ? ' is-open' : '')} aria-label="Main navigation">
           {links.map(([label, href]) => <a key={href} href={href} aria-current={active === href ? 'page' : undefined} onClick={() => setOpen(false)}>{label}</a>)}
+          <Link to="/overview" onClick={() => setOpen(false)}>Traffic Overview</Link>
           <Link className="meridian-nav__mobile-cta" to="/console" onClick={() => setOpen(false)}>Launch Console <ArrowUpRight /></Link>
         </nav>
         <Link className="meridian-nav__cta" to="/console">Launch Console <ArrowUpRight size={17} /></Link>

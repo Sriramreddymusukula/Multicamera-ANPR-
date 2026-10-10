@@ -21,6 +21,9 @@ const Register = lazy(() =>
 const Console = lazy(() =>
   import('./pages/Console').then((module) => ({ default: module.Console })),
 )
+const Reviews = lazy(() =>
+  import('./pages/Reviews').then((module) => ({ default: module.Reviews })),
+)
 const Search = lazy(() =>
   import('./pages/Search').then((module) => ({ default: module.Search })),
 )
@@ -86,6 +89,7 @@ export default function App() {
                 </RequireAuth>
               }
             />
+            <Route path="reviews" element={<RequireAuth><Suspense fallback={<RouteFallback />}><Reviews /></Suspense></RequireAuth>} />
             <Route
               path="search"
               element={

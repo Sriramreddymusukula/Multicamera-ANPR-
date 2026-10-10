@@ -6,7 +6,9 @@ vehicle_database.csv
 
 # Web layer
 web/backend/.secret
+web/backend/.gemini-key
 web/backend/web_users.db
+web/backend/reviews.db
 web/backend/.uploads/
 web/frontend/node_modules/
 web/frontend/dist/

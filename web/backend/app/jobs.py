@@ -15,7 +15,7 @@ from datetime import datetime, timezone
 
 from processing import process_video
 
-from . import services
+from . import review, services
 
 logger = logging.getLogger(__name__)
 
@@ -108,8 +108,10 @@ class JobStore:
             result = process_video(
                 video_path,
                 camera,
-                progress_callback=progress
+                progress_callback=progress,
+                persist=False,
             )
+            reviewed = review.ingest(result["detections"])
 
             self._update(
                 job_id,
@@ -121,10 +123,11 @@ class JobStore:
                 },
                 result={
                     "detections": services.serialize_detections(
-                        result["detections"]
+                        reviewed["detections"]
                     ),
                     "source_label": result["source_label"],
-                    "saved_count": result["saved_count"]
+                    "saved_count": reviewed["saved_count"],
+                    "pending_count": reviewed["pending_count"],
                 }
             )
 

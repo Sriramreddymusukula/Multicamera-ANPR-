@@ -10,6 +10,7 @@ import { api } from '../lib/api'
 import { useAuth } from '../lib/auth'
 import { activityLevelClass, fmtInt } from '../lib/format'
 import { useReveal } from '../lib/motion'
+import { enableReviewSound } from '../lib/reviewSound'
 import { Ticker } from './Ticker'
 import { MeridianShell } from './MeridianShell'
 import '../styles/workspace.css'
@@ -18,6 +19,7 @@ const NAV = [
   { to: '/', label: 'Meridian', end: true },
   { to: '/overview', label: 'Overview' },
   { to: '/console', label: 'Console', locked: true },
+  { to: '/reviews', label: 'Review', locked: true },
   { to: '/search', label: 'Vehicle Search', locked: true },
   { to: '/tracking', label: 'Tracking', locked: true },
 ]
@@ -28,6 +30,7 @@ const TITLES = {
   '/login': 'Operator Login',
   '/register': 'Operator Registration',
   '/console': 'ANPR Console',
+  '/reviews': 'Observation Review',
   '/search': 'Vehicle Search',
   '/tracking': 'Multi-Camera Tracking',
 }
@@ -50,6 +53,16 @@ export function Layout() {
   const [menuOpen, setMenuOpen] = useState(false)
 
   useReveal(mainRef, [location.pathname])
+
+  useEffect(() => {
+    const unlock = () => { void enableReviewSound() }
+    window.addEventListener('pointerdown', unlock)
+    window.addEventListener('keydown', unlock)
+    return () => {
+      window.removeEventListener('pointerdown', unlock)
+      window.removeEventListener('keydown', unlock)
+    }
+  }, [])
 
   useEffect(() => {
     let active = true

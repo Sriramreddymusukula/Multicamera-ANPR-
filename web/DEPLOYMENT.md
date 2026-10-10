@@ -40,7 +40,9 @@ Create `/etc/meridian.env` with a long random value and restrict it to the accou
 ANPR_WEB_SECRET=replace-with-a-random-secret
 ```
 
-Keep this value stable across restarts. If it changes, existing sessions become invalid. Do not commit the file. Back up `vehicle_database.csv`, `output/`, and `web/backend/web_users.db` together; these hold observations, evidence, and accounts.
+Keep this value stable across restarts. If it changes, existing sessions become invalid. Do not commit the file. Back up `vehicle_database.csv`, `output/`, `web/backend/web_users.db`, and `web/backend/reviews.db` together; these hold observations, evidence, accounts, and review decisions.
+
+Optional second reader: set `ANPR_GEMINI_API_KEY` in `/etc/meridian.env` or store it in an ignored `web/backend/.gemini-key` file on Linux. On Windows, a local key file can live at `%LOCALAPPDATA%\Meridian\gemini.key`. Gemini reads uncertain cropped plates and, for pending reviews with a valid plate box, a saved frame with that plate masked to suggest vehicle colour and body style. `ANPR_GOOGLE_VISION_API_KEY` is supported as a plate-reading fallback if Gemini is absent. Keep keys on the server; account for provider charges and data handling before enabling them. Without either key, local YOLOv8 and Tesseract detection still works and uncertain reads still enter the review queue.
 
 ## 4. Run FastAPI as a service
 
@@ -100,6 +102,6 @@ sudo nginx -t
 sudo systemctl reload nginx
 ```
 
-The frontend uses relative `/api` URLs, so the website and API must be served from the same public origin. Check `/`, `/overview`, `/console` (redirects to login anonymously), `/api/health`, and an actual operator upload after deployment.
+The frontend uses relative `/api` URLs, so the website and API must be served from the same public origin. Check `/`, `/overview`, `/console` and `/reviews` (both redirect to login anonymously), `/api/health`, and an actual operator upload after deployment.
 
 **Before an internet-facing deployment with real vehicle data:** the current `.cop@` rule validates email format, not operator identity. Restrict account creation to trusted staff or add email verification/approval, and define retention and access policies for stored registration data and evidence.

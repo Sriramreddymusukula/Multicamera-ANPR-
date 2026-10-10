@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
+import { Link } from 'react-router-dom'
 import {
   Camera,
   CheckCircle,
@@ -10,6 +11,7 @@ import {
 import { api } from '../lib/api'
 import { fmtBytes, fmtPercent } from '../lib/format'
 import { EvidenceThumb } from '../components/EvidenceThumb'
+import { enableReviewSound, playReviewSound } from '../lib/reviewSound'
 
 const MODES = [
   { id: 'image', label: 'Image', icon: Image, accept: '.jpg,.jpeg,.png,.bmp' },
@@ -27,6 +29,8 @@ function DetectionTable({ detections }) {
       <thead>
         <tr>
           <th>Plate</th>
+          <th title="Tesseract text confidence, separate from detector score">OCR score</th>
+          <th>Review</th>
           <th title="YOLO plate-region detection score; verify OCR text against evidence">Detector score</th>
           <th>Camera</th>
           <th>Recorded</th>
@@ -38,6 +42,13 @@ function DetectionTable({ detections }) {
           <tr key={`${detection.plate_number}-${index}`}>
             <td>
               <span className="chip chip--plate">{detection.plate_number}</span>
+            </td>
+            <td>{detection.ocr_confidence == null ? '—' : fmtPercent(detection.ocr_confidence)}</td>
+            <td>
+              {detection.review_status === 'pending'
+                ? <Link className="chip chip--review" to="/reviews">Needs review</Link>
+                : <span className="chip">Accepted</span>}
+              {detection.provider_read && <small className="console-workspace__provider">Second read: {detection.provider_read}</small>}
             </td>
             <td>
               <span className="confidence">
@@ -55,6 +66,7 @@ function DetectionTable({ detections }) {
               <span style={{ color: 'var(--text-3)' }}>
                 {detection.location}
               </span>
+              {detection.source_name && <small className="console-workspace__provider">{detection.source_name}</small>}
             </td>
             <td className="num" style={{ color: 'var(--text-2)' }}>
               {detection.timestamp || '—'}
@@ -81,7 +93,7 @@ export function Console() {
   const [cameras, setCameras] = useState([])
   const [cameraId, setCameraId] = useState('')
   const [mode, setMode] = useState('image')
-  const [file, setFile] = useState(null)
+  const [files, setFiles] = useState([])
   const [dragging, setDragging] = useState(false)
   const [busy, setBusy] = useState(false)
   const [error, setError] = useState(null)
@@ -115,6 +127,7 @@ export function Console() {
 
         if (status.status === 'completed') {
           setResult(status.result)
+          if (status.result?.pending_count) playReviewSound()
           setBusy(false)
           return
         }
@@ -145,7 +158,7 @@ export function Console() {
 
   const selectMode = useCallback((nextMode) => {
     setMode(nextMode)
-    setFile(null)
+    setFiles([])
     setError(null)
     if (fileInput.current) fileInput.current.value = ''
   }, [])
@@ -154,18 +167,23 @@ export function Console() {
     (event) => {
       event.preventDefault()
       setDragging(false)
-      const dropped = event.dataTransfer?.files?.[0]
-      if (dropped) {
-        setFile(dropped)
+      const dropped = Array.from(event.dataTransfer?.files || [])
+      if (dropped.length) {
+        setFiles(mode === 'image' ? dropped : dropped.slice(0, 1))
         setError(null)
       }
     },
-    [],
+    [mode],
   )
 
   const run = async () => {
-    if (!file || !cameraId) {
+    try { await enableReviewSound() } catch { /* Sound is optional. */ }
+    if (!files.length || !cameraId) {
       setError('Choose a camera and a file before running detection.')
+      return
+    }
+    if (mode === 'image' && (files.length > 10 || files.some((file) => file.size > 25 * 1024 * 1024) || files.reduce((sum, file) => sum + file.size, 0) > 100 * 1024 * 1024)) {
+      setError('Choose up to 10 images, each under 25 MB and 100 MB total.')
       return
     }
 
@@ -176,16 +194,18 @@ export function Console() {
 
     const form = new FormData()
     form.append('camera_id', cameraId)
-    form.append('file', file)
+    if (mode === 'image') files.forEach((file) => form.append('files', file))
+    else form.append('file', files[0])
 
     try {
       if (mode === 'image') {
-        const data = await api('/detect/image', {
+        const data = await api('/detect/images', {
           method: 'POST',
           form,
           auth: true,
         })
         setResult(data)
+        if (data.pending_count) playReviewSound()
         setBusy(false)
       } else {
         const data = await api('/detect/video', {
@@ -285,28 +305,29 @@ export function Console() {
               <UploadSimple size={26} className="dropzone__icon" />
               <span className="dropzone__title">
                 {mode === 'image'
-                  ? 'Drop a vehicle image here'
+                  ? 'Drop vehicle images here'
                   : 'Drop a traffic video here'}
               </span>
               <span className="dropzone__hint">
                 {mode === 'image'
-                  ? 'JPG · PNG · BMP — up to 25 MB'
+                  ? 'JPG · PNG · BMP — up to 10 images, 25 MB each'
                   : 'MP4 · AVI · MKV · MOV — up to 300 MB, sampled at 3 fps'}
               </span>
-              {file && (
+              {files.length > 0 && (
                 <span className="dropzone__file">
                   <activeMode.icon size={13} />
-                  {file.name} · {fmtBytes(file.size)}
+                  {files.length === 1 ? `${files[0].name} · ${fmtBytes(files[0].size)}` : `${files.length} images · ${fmtBytes(files.reduce((sum, file) => sum + file.size, 0))}`}
                 </span>
               )}
               <input
                 id="console-file"
                 ref={fileInput}
                 type="file"
+                multiple={mode === 'image'}
                 accept={activeMode.accept}
                 hidden
                 onChange={(event) => {
-                  setFile(event.target.files?.[0] || null)
+                  setFiles(Array.from(event.target.files || []))
                   setError(null)
                 }}
               />
@@ -317,7 +338,7 @@ export function Console() {
               className="btn btn--primary"
               style={{ width: '100%', marginTop: 16 }}
               onClick={run}
-              disabled={busy || !file}
+              disabled={busy || !files.length}
             >
               <Camera size={15} />
               {busy
@@ -361,8 +382,7 @@ export function Console() {
               <h2 className="panel__title">02 / Evidence review</h2>
               {result && (
                 <span className="panel__meta">
-                  {result.detections.length} plate(s) · {result.saved_count}{' '}
-                  record(s) saved
+                  {result.detections.length} plate(s) · {result.saved_count} saved · {result.pending_count || 0} awaiting review
                 </span>
               )}
             </div>
@@ -389,11 +409,11 @@ export function Console() {
 
             {result && result.detections.length > 0 && (
               <>
+                {result.pending_count > 0 && <div className="alert review-workspace__notice" role="status"><WarningCircle size={18} /> {result.pending_count} observation(s) need a human decision. <Link to="/reviews">Open review queue</Link></div>}
                 <div className="alert alert--success" style={{ marginBottom: 14 }}>
                   <CheckCircle size={17} style={{ flex: 'none', marginTop: 1 }} />
                   <span>
-                    {result.source_label} processed · {result.saved_count}{' '}
-                    record(s) added to the shared detection database.
+                    {result.source_label} processed · {result.saved_count} saved · {result.pending_count || 0} awaiting review.
                   </span>
                 </div>
                 <div style={{ overflowX: 'auto' }}>

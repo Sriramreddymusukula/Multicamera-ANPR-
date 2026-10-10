@@ -12,7 +12,9 @@ importing this module and unit-testing the text logic stays cheap.
 
 import importlib.util
 import logging
+import math
 import os
+import statistics
 import threading
 import uuid
 
@@ -401,6 +403,90 @@ def _build_ocr_variants(plate, prepared=None):
     ]
 
 
+def _deskew_plate(plate):
+    """Level a tilted plate using the long near-horizontal border lines."""
+
+    height, width = plate.shape[:2]
+    if width < 70 or height < 20:
+        return plate
+
+    gray = cv2.cvtColor(plate, cv2.COLOR_BGR2GRAY)
+    edges = cv2.Canny(gray, 60, 150)
+    lines = cv2.HoughLinesP(
+        edges, 1, math.pi / 180, 30,
+        minLineLength=max(40, int(width * 0.35)),
+        maxLineGap=15,
+    )
+    if lines is None:
+        return plate
+
+    angles = []
+    for x1, y1, x2, y2 in lines.reshape(-1, 4):
+        angle = math.degrees(math.atan2(int(y2-y1), int(x2-x1)))
+        if abs(angle) <= 20:
+            angles.append(angle)
+
+    if len(angles) < 3:
+        return plate
+
+    angle = statistics.median(angles)
+    if abs(angle) < 2 or abs(angle) > 18:
+        return plate
+
+    matrix = cv2.getRotationMatrix2D((width / 2, height / 2), angle, 1)
+    return cv2.warpAffine(
+        plate, matrix, (width, height),
+        flags=cv2.INTER_CUBIC,
+        borderMode=cv2.BORDER_REPLICATE,
+    )
+
+
+def _read_tilted_plate(plate):
+    """Vote on natural-image OCR near the estimated plate angle.
+
+    Thresholded passes can consistently turn a thin 4 into 2 or S into 5.
+    Requiring the same candidate at two nearby angles avoids accepting a
+    single lucky read while keeping this extra work to difficult crops.
+    """
+    height, width = plate.shape[:2]
+    leveled = _deskew_plate(plate)
+    votes = {}
+    config = (
+        "--oem 3 --psm 7 "
+        "-c tessedit_char_whitelist=ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
+    )
+    for offset in (-4, -2, 0, 2, 4):
+        image = leveled
+        if offset:
+            matrix = cv2.getRotationMatrix2D(
+                (width / 2, height / 2), offset, 1
+            )
+            image = cv2.warpAffine(
+                leveled, matrix, (width, height),
+                flags=cv2.INTER_CUBIC,
+                borderMode=cv2.BORDER_REPLICATE,
+            )
+        gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+        enlarged = cv2.resize(
+            gray, None, fx=4, fy=4,
+            interpolation=cv2.INTER_CUBIC,
+        )
+        raw, confidence = _tesseract_read(enlarged, config)
+        candidates = list(find_plate_candidates(_normalize_text(raw)))
+        if candidates:
+            candidate, score = max(candidates, key=lambda item: item[1])
+            if score >= 8:
+                entry = votes.setdefault(candidate, [0, 0.0])
+                entry[0] += 1
+                entry[1] += confidence
+    if not votes:
+        return "", 0.0
+    best = max(votes, key=lambda value: (votes[value][0], votes[value][1]))
+    if votes[best][0] >= 2:
+        return best, votes[best][1] / votes[best][0]
+    return "", 0.0
+
+
 def _tesseract_read(image, config):
     """Run one OCR pass. Returns (text, mean confidence)."""
 
@@ -448,7 +534,7 @@ def _tesseract_read(image, config):
     return text, mean_confidence
 
 
-def ocr_plate_text(plate, prepared=None):
+def ocr_plate_text(plate, prepared=None, return_confidence=False):
     """
     Multi-variant OCR + Indian plate candidate scoring.
 
@@ -478,10 +564,20 @@ def ocr_plate_text(plate, prepared=None):
 
             continue
 
+        matches = {}
         for candidate, score in find_plate_candidates(cleaned):
 
             if score < 5:
                 continue
+
+            matches[candidate] = max(score, matches.get(candidate, -1))
+
+        # Natural grayscale/color preserves thin strokes which thresholding
+        # can erase or turn into a different digit. Count these readings more
+        # strongly, but still require a structurally valid plate candidate.
+        weight = 3 if name == "source-gray" else 2 if name == "source-color" else 1
+
+        for candidate, score in matches.items():
 
             entry = candidates.get(candidate)
 
@@ -490,6 +586,7 @@ def ocr_plate_text(plate, prepared=None):
                 candidates[candidate] = {
                     "score": score,
                     "hits": 1,
+                    "support": weight,
                     "confidence": confidence
                 }
 
@@ -498,6 +595,7 @@ def ocr_plate_text(plate, prepared=None):
                 entry["score"] = max(entry["score"], score)
 
                 entry["hits"] += 1
+                entry["support"] += weight
 
                 entry["confidence"] = max(
                     entry["confidence"],
@@ -506,13 +604,13 @@ def ocr_plate_text(plate, prepared=None):
 
     if not candidates:
 
-        return "", raw_texts
+        return ("", raw_texts, 0.0) if return_confidence else ("", raw_texts)
 
     best_plate = max(
         candidates,
         key=lambda candidate: (
             candidates[candidate]["score"]
-            + 2 * (candidates[candidate]["hits"] - 1),
+            + 2 * (candidates[candidate]["support"] - 1),
             candidates[candidate]["hits"],
             candidates[candidate]["confidence"]
         )
@@ -520,13 +618,15 @@ def ocr_plate_text(plate, prepared=None):
 
     best_combined = (
         candidates[best_plate]["score"]
-        + 2 * (candidates[best_plate]["hits"] - 1)
+        + 2 * (candidates[best_plate]["support"] - 1)
     )
 
     if best_combined < 5:
 
-        return "", raw_texts
+        return ("", raw_texts, 0.0) if return_confidence else ("", raw_texts)
 
+    if return_confidence:
+        return best_plate, raw_texts, candidates[best_plate]["confidence"]
     return best_plate, raw_texts
 
 
@@ -650,6 +750,8 @@ def detect_number_plates(image, save_artifacts=True, verbose=True):
 
                 continue
 
+            raw_box = (x1, y1, x2, y2)
+
             # ------------------------------------------------
             # ADD PADDING
             # ------------------------------------------------
@@ -709,7 +811,32 @@ def detect_number_plates(image, save_artifacts=True, verbose=True):
             # TESSERACT OCR (MULTI-VARIANT + CANDIDATE SCORING)
             # ------------------------------------------------
 
-            plate_text, raw_texts = ocr_plate_text(plate, prepared)
+            plate_text, raw_texts, ocr_confidence = ocr_plate_text(
+                plate, prepared, return_confidence=True
+            )
+
+            # The padded crop can include the boot, bumper, or another
+            # vehicle. Retry on the detector's tighter plate box and level
+            # a slanted plate before giving up on this image.
+            tight = img[
+                raw_box[1]:raw_box[3],
+                raw_box[0]:raw_box[2]
+            ]
+
+            if not plate_text and tight.size:
+                plate_text, ocr_confidence = _read_tilted_plate(tight)
+                leveled = tight
+                if not plate_text:
+                    leveled = _deskew_plate(tight)
+                    plate_text, retry_texts, ocr_confidence = ocr_plate_text(
+                        leveled, return_confidence=True
+                    )
+                    raw_texts.extend(f"tight-{item}" for item in retry_texts)
+                if not plate_text and leveled is not tight:
+                    plate_text, retry_texts, ocr_confidence = ocr_plate_text(
+                        tight, return_confidence=True
+                    )
+                    raw_texts.extend(f"tight-raw-{item}" for item in retry_texts)
 
             for raw_text in raw_texts:
 
@@ -742,6 +869,9 @@ def detect_number_plates(image, save_artifacts=True, verbose=True):
                 "confidence":
                     round(confidence, 4),
 
+                "ocr_confidence":
+                    round(ocr_confidence, 4),
+
                 "bbox": (
                     x1,
                     y1,
@@ -756,7 +886,10 @@ def detect_number_plates(image, save_artifacts=True, verbose=True):
                     preprocess_path,
 
                 "plate_image":
-                    plate.copy()
+                    plate.copy(),
+
+                "raw_plate_image":
+                    tight.copy()
             })
 
     # ========================================================

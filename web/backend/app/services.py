@@ -565,6 +565,15 @@ def serialize_detections(detections):
             "timestamp": detection.get("timestamp", ""),
             "evidence": _evidence_name(detection.get("cropped_plate")),
             "frame": _evidence_name(detection.get("image_path")),
+            "ocr_confidence": detection.get("ocr_confidence"),
+            "match_confidence": detection.get("match_confidence"),
+            "alternatives": detection.get("alternatives", []),
+            "review_id": detection.get("review_id"),
+            "review_status": detection.get("review_status", "accepted"),
+            "review_reasons": detection.get("review_reasons", []),
+            "provider": detection.get("provider"),
+            "provider_read": detection.get("provider_read"),
+            "source_name": detection.get("source_name"),
         }
 
         if "hits" in detection:

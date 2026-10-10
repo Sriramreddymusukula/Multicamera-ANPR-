@@ -4,7 +4,7 @@ import { useGSAP } from '@gsap/react'
 import { gsap } from '../lib/motion'
 import '../styles/route-curtain.css'
 
-const operationalRoutes = new Set(['/overview', '/console'])
+const operationalRoutes = new Set(['/overview', '/console', '/reviews'])
 
 export function RouteCurtain() {
   const { pathname } = useLocation()
