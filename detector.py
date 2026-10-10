@@ -333,6 +333,24 @@ def _build_ocr_variants(plate, prepared=None):
 
     gray, gray_soft = prepared
 
+    # Keep a lightly processed view of the original crop. Video frames
+    # often lose thin strokes when the padded crop is refined and
+    # binarized; an alphanumeric whitelist lets Tesseract read those
+    # strokes without competing with punctuation.
+    source_gray = cv2.cvtColor(plate, cv2.COLOR_BGR2GRAY)
+    source_gray = cv2.resize(
+        source_gray, None, fx=4, fy=4,
+        interpolation=cv2.INTER_CUBIC
+    )
+    source_color = cv2.resize(
+        plate, None, fx=4, fy=4,
+        interpolation=cv2.INTER_CUBIC
+    )
+    whitelist = (
+        "--oem 3 --psm 7 "
+        "-c tessedit_char_whitelist=ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
+    )
+
     _, fixed_150 = cv2.threshold(
         gray,
         150,
@@ -372,6 +390,8 @@ def _build_ocr_variants(plate, prepared=None):
     norm_otsu_inverted = 255 - norm_otsu
 
     return [
+        ("source-gray", source_gray, whitelist),
+        ("source-color", source_color, whitelist),
         ("fixed150", fixed_150, "--oem 3 --psm 7"),
         ("otsu", otsu, "--oem 3 --psm 7"),
         ("fixed120", fixed_120, "--oem 3 --psm 7"),
@@ -459,6 +479,9 @@ def ocr_plate_text(plate, prepared=None):
             continue
 
         for candidate, score in find_plate_candidates(cleaned):
+
+            if score < 5:
+                continue
 
             entry = candidates.get(candidate)
 

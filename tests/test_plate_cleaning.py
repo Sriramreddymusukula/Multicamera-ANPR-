@@ -108,6 +108,15 @@ def test_candidate_extraction():
 
     assert best("0D02XY1234") == "OD02XY1234"
 
+    # OCR fragments with a letter where the district must begin
+    # are rejected instead of being stored as plausible registrations.
+    assert max(
+        (score for _, score in find_plate_candidates("UKU7BS1542")),
+        default=-1,
+    ) < 5
+    assert best("UKC8S4542") is None
+    assert best("UKO7BS4542") == "UK07BS4542"
+
     # verbatim read ending with a letter series (trailing A)
     assert best("MH02TCC43A") == "MH02TCC43A"
 

@@ -1,0 +1,152 @@
+.workspace-shell {
+  --bg: #0b1111;
+  --bg-soft: #111b19;
+  --surface: #15201d;
+  --surface-2: #1b2924;
+  --overlay: #213129;
+  --border: rgba(198, 220, 198, .13);
+  --border-strong: rgba(198, 220, 198, .27);
+  --text: #edf1e9;
+  --text-2: #b4c3b5;
+  --text-3: #849787;
+  --accent: #a6d69d;
+  --accent-deep: #8cc58a;
+  --accent-soft: rgba(166, 214, 157, .12);
+  --accent-ink: #152018;
+  --series-1: #a6d69d;
+  --series-2: #8bb8aa;
+  --series-3: #c5bba1;
+  --series-4: #a8aec8;
+  display: flex;
+  flex: 1;
+  flex-direction: column;
+  min-height: 100vh;
+  background: #0b1111;
+}
+
+.workspace-shell .topbar {
+  background: rgba(11, 18, 17, .93);
+  border-bottom-color: #2d3a33;
+}
+
+.workspace-shell .brand__mark { width: 32px; height: 32px; }
+.workspace-shell .brand__name { letter-spacing: .19em; font-size: 13px; }
+.workspace-shell .brand__sub { font-size: 9px; letter-spacing: .11em; }
+.workspace-shell .nav__link { border-radius: 0; }
+.workspace-shell .nav__link.is-active {
+  background: transparent;
+  box-shadow: inset 0 -1px 0 var(--accent);
+  color: #e7f5e2;
+}
+
+.workspace-shell .statusbar {
+  background: #111b18;
+  border-bottom-color: #2b3931;
+}
+
+.workspace-shell .ticker {
+  background: #0d1513;
+}
+
+.workspace-shell .page {
+  width: min(100%, 1580px);
+  padding: clamp(26px, 3vw, 48px) clamp(20px, 4vw, 68px) 90px;
+}
+
+.workspace-shell .page-title {
+  font-size: clamp(34px, 4vw, 62px);
+  font-weight: 400;
+  letter-spacing: -.05em;
+  line-height: 1.05;
+}
+
+.workspace-shell .page-sub { font-size: 15px; line-height: 1.6; }
+.workspace-shell .eyebrow { color: #a9d49d; }
+.workspace-shell .panel {
+  border-radius: 2px;
+  background: #131d1a;
+  box-shadow: none;
+}
+.workspace-shell .panel__head { border-bottom: 1px solid var(--border); padding-bottom: 16px; margin-bottom: 22px; }
+.workspace-shell .panel__title { color: #dce9d9; }
+.workspace-shell .btn { border-radius: 2px; }
+.workspace-shell .btn--primary { background: #add7a4; color: #122018; }
+.workspace-shell .btn--primary:hover { background: #c0e4b7; }
+.workspace-shell .dropzone { border-radius: 2px; background: #0e1715; }
+.workspace-shell .dropzone:hover,
+.workspace-shell .dropzone.is-drag { background: #1a3024; }
+.workspace-shell .select { border-radius: 2px; }
+.workspace-shell .footer { margin-top: auto; background: #0e1513; }
+
+.console-workspace__hero {
+  min-height: 280px;
+  padding: clamp(25px, 4vw, 54px);
+  margin-bottom: 0;
+  overflow: hidden;
+  position: relative;
+  align-items: center;
+  background: #14201b;
+  border: 1px solid #35493c;
+  isolation: isolate;
+}
+
+.console-workspace__hero::before {
+  content: "";
+  position: absolute;
+  z-index: -1;
+  inset: 0 0 0 38%;
+  background: linear-gradient(90deg, #14201b 0%, rgba(20, 32, 27, .45) 30%, rgba(10, 21, 18, .1) 100%), url('/images/meridian-hero.webp') center 52% / cover;
+  filter: saturate(.64) brightness(.74);
+}
+
+.console-workspace__hero > div:first-child { position: relative; z-index: 1; max-width: 640px; }
+.console-workspace__hero .page-title { margin-top: 20px; }
+.console-workspace__hero .page-sub { max-width: 510px; color: #c7d4c6; margin-top: 16px; }
+.console-workspace__hero-art {
+  position: absolute;
+  z-index: 1;
+  right: 20px;
+  bottom: 18px;
+  font: 10px var(--font-mono);
+  letter-spacing: .12em;
+  color: #c4d4c5;
+}
+.console-workspace__hero-art span { display: flex; align-items: center; gap: 12px; }
+.console-workspace__hero-art i { width: 26px; height: 1px; background: #a6d69d; }
+.console-workspace__intro {
+  display: flex;
+  justify-content: space-between;
+  gap: 16px;
+  padding: 16px 4px 19px;
+  color: #9fb3a3;
+  font: 10px var(--font-mono);
+  letter-spacing: .11em;
+}
+.console-workspace__intro span:last-child { color: #718b78; }
+.console-workspace__grid { gap: 20px; }
+.console-workspace__input,
+.console-workspace__results { min-height: 485px; padding: clamp(20px, 2vw, 32px) !important; }
+.console-workspace__input .field { margin-bottom: 24px; }
+.console-workspace__input .dropzone { min-height: 178px; }
+.console-workspace__results .empty-state { min-height: 310px; }
+.console-workspace__results .table th { white-space: nowrap; }
+
+@media (max-width: 1080px) {
+  .console-workspace__results { min-height: 360px; }
+  .workspace-shell .mobile-menu { background: #101c18; }
+}
+
+@media (max-width: 700px) {
+  .workspace-shell .page { padding: 20px 16px 70px; }
+  .workspace-shell .operator-chip { display: none; }
+  .workspace-shell .topbar { gap: 8px; padding: 0 15px; }
+  .workspace-shell .topbar__actions { gap: 8px; }
+  .workspace-shell .brand__sub { font-size: 8px; }
+  .console-workspace__hero { min-height: 330px; padding: 28px; align-items: flex-start; }
+  .console-workspace__hero::before { inset: 20% 0 0 0; background: linear-gradient(180deg, #14201b 3%, rgba(20, 32, 27, .75) 40%, rgba(10, 21, 18, .22)), url('/images/meridian-hero.webp') center / cover; }
+  .console-workspace__hero-art { font-size: 8px; }
+  .console-workspace__intro { flex-wrap: wrap; font-size: 9px; }
+  .console-workspace__intro span:last-child { width: 100%; }
+  .console-workspace__input,
+  .console-workspace__results { min-height: 0; }
+}

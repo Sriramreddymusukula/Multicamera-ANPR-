@@ -53,7 +53,7 @@ PADDING_Y = 30
 # ============================================================
 
 # Frames analyzed per second of video (1-3 is a good range).
-VIDEO_SAMPLE_FPS = 2.0
+VIDEO_SAMPLE_FPS = 3.0
 
 # A plate must be read in at least this many analyzed frames
 # to be accepted as a vehicle in the video.
@@ -125,27 +125,37 @@ CAMERAS = {
 
     "CAM-01 - Suchitra Junction": {
         "id": "CAM-01",
-        "location": "Suchitra Junction"
+        "location": "Suchitra Junction",
+        "coordinates": {"lat": 17.4995, "lon": 78.4766}
     },
 
     "CAM-02 - Kukatpally": {
         "id": "CAM-02",
-        "location": "Kukatpally"
+        "location": "Kukatpally",
+        "coordinates": {"lat": 17.4851, "lon": 78.4116}
     },
 
     "CAM-03 - JNTU Road": {
         "id": "CAM-03",
-        "location": "JNTU Road"
+        "location": "JNTU Road",
+        "coordinates": {"lat": 17.4902, "lon": 78.3926}
     },
 
     "CAM-04 - Miyapur": {
         "id": "CAM-04",
-        "location": "Miyapur"
+        "location": "Miyapur",
+        "coordinates": {"lat": 17.4965, "lon": 78.3730}
     }
 }
 
 # Fast camera-id -> location lookup used by analytics views.
 CAMERA_LOCATION_BY_ID = {
     camera["id"]: camera["location"]
+    for camera in CAMERAS.values()
+}
+
+# Fast camera-id -> full camera record lookup (web API).
+CAMERA_BY_ID = {
+    camera["id"]: camera
     for camera in CAMERAS.values()
 }

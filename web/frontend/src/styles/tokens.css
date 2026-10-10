@@ -1,0 +1,68 @@
+/*
+ * Design tokens — dark-first command centre.
+ * Calm density: true-grey layered surfaces, one accent, mono numerals.
+ * Palette generated via ui-ux-pro-max (Dark Mode OLED + status green),
+ * tuned for 2026 dark-dashboard practice (layered elevation, no pure black).
+ */
+
+:root {
+  /* Surfaces (3 elevation levels, each ~3-6% lighter) */
+  --bg: #0a0e15;
+  --bg-soft: #0d131c;
+  --surface: #121a28;
+  --surface-2: #16202f;
+  --overlay: #1b2637;
+
+  /* Lines */
+  --border: rgba(148, 163, 184, 0.11);
+  --border-strong: rgba(148, 163, 184, 0.24);
+
+  /* Text */
+  --text: #e8eef7;
+  --text-2: #9aa7bc;
+  --text-3: #64748b;
+
+  /* Accents */
+  --accent: #22c55e;
+  --accent-deep: #16a34a;
+  --accent-soft: rgba(34, 197, 94, 0.12);
+  --accent-ink: #06130a;
+
+  --cyan: #38bdf8;
+  --cyan-soft: rgba(56, 189, 248, 0.12);
+  --amber: #f5a623;
+  --amber-soft: rgba(245, 166, 35, 0.12);
+  --red: #ef4444;
+  --red-soft: rgba(239, 68, 68, 0.12);
+  --violet: #a78bfa;
+
+  /* Data-viz palette (dark-first, desaturated) */
+  --series-1: #4ade80;
+  --series-2: #38bdf8;
+  --series-3: #a78bfa;
+  --series-4: #fbbf24;
+
+  /* Type */
+  --font-ui: "Fira Sans", system-ui, -apple-system, "Segoe UI", sans-serif;
+  --font-mono: "Fira Code", ui-monospace, "Cascadia Mono", Consolas, monospace;
+
+  /* Geometry */
+  --radius: 12px;
+  --radius-sm: 8px;
+  --radius-pill: 999px;
+
+  /* Spacing rhythm (4/8) */
+  --sp-1: 4px;
+  --sp-2: 8px;
+  --sp-3: 12px;
+  --sp-4: 16px;
+  --sp-5: 24px;
+  --sp-6: 32px;
+  --sp-7: 48px;
+
+  --topbar-h: 60px;
+  --statusbar-h: 34px;
+  --ticker-h: 36px;
+
+  --shadow-float: 0 18px 44px rgba(2, 6, 12, 0.55);
+}

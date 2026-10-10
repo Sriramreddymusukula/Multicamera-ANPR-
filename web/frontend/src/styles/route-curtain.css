@@ -1,0 +1,57 @@
+.route-curtain {
+  position: fixed;
+  inset: 0;
+  z-index: 2500;
+  pointer-events: none;
+  display: grid;
+  place-items: center;
+  background: #101c19;
+  overflow: hidden;
+}
+
+.route-curtain::before,
+.route-curtain::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+}
+
+.route-curtain::before {
+  background: repeating-linear-gradient(
+    90deg,
+    transparent 0,
+    transparent calc(25% - 1px),
+    rgba(184, 226, 142, 0.14) calc(25% - 1px),
+    rgba(184, 226, 142, 0.14) 25%
+  );
+}
+
+.route-curtain::after {
+  width: 4px;
+  left: auto;
+  right: 0;
+  background: #9bd5a5;
+}
+
+.route-curtain__label {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 10px;
+  color: #f1f5ef;
+}
+
+.route-curtain__label span {
+  font-size: clamp(36px, 6vw, 78px);
+  font-weight: 500;
+  letter-spacing: .28em;
+  line-height: 1;
+}
+
+.route-curtain__label small {
+  font: 10px var(--font-mono);
+  letter-spacing: .22em;
+  color: #b5ceb8;
+}

@@ -244,6 +244,12 @@ def find_plate_candidates(cleaned_text):
 
             plate = state + fixed[2:]
 
+            # The district starts immediately after the state code.
+            # Requiring its first digit prevents plausible-looking OCR
+            # fragments such as UKU7BS1542 from being accepted as plates.
+            if not plate[2].isdigit():
+                continue
+
             corrections = _count_changes(window, fixed)
 
             corrections += _count_changes(fixed[:2], plate[:2])

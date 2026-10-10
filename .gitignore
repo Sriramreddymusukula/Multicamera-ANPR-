@@ -3,3 +3,11 @@ __pycache__/
 *.pyc
 output/*
 vehicle_database.csv
+
+# Web layer
+web/backend/.secret
+web/backend/web_users.db
+web/backend/.uploads/
+web/frontend/node_modules/
+web/frontend/dist/
+web/frontend/.vite/
