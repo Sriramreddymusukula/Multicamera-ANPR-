@@ -42,7 +42,7 @@ ANPR_WEB_SECRET=replace-with-a-random-secret
 
 Keep this value stable across restarts. If it changes, existing sessions become invalid. Do not commit the file. Back up `vehicle_database.csv`, `output/`, `web/backend/web_users.db`, and `web/backend/reviews.db` together; these hold observations, evidence, accounts, and review decisions.
 
-Optional second reader: set `ANPR_GEMINI_API_KEY` in `/etc/meridian.env` or store it in an ignored `web/backend/.gemini-key` file on Linux. On Windows, a local key file can live at `%LOCALAPPDATA%\Meridian\gemini.key`. Gemini reads uncertain cropped plates and, for pending reviews with a valid plate box, a saved frame with that plate masked to suggest vehicle colour and body style. `ANPR_GOOGLE_VISION_API_KEY` is supported as a plate-reading fallback if Gemini is absent. Keep keys on the server; account for provider charges and data handling before enabling them. Without either key, local YOLOv8 and Tesseract detection still works and uncertain reads still enter the review queue.
+Optional second reader: set `ANPR_GEMINI_API_KEY` in `/etc/meridian.env` or store it in an ignored `web/backend/.gemini-key` file on Linux. On Windows, a local key file can live at `%LOCALAPPDATA%\Meridian\gemini.key`. Gemini is used only to read available plate crops and is not asked for vehicle color or body style. `ANPR_GOOGLE_VISION_API_KEY` is supported as a plate-reading fallback if Gemini is absent. Keep keys on the server; account for provider charges and data handling before enabling them. Without either key, local YOLOv8 and Tesseract detection still works and uncertain reads still enter the review queue.
 
 ## 4. Run FastAPI as a service
 

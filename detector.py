@@ -56,6 +56,13 @@ if _tesseract_cmd:
     )
 
 
+# RapidOCR is the primary local plate-text recognizer. Keep it lazy so tools
+# that only use the text-cleaning helpers do not initialize ONNX models.
+_rapid_ocr = None
+_rapid_ocr_lock = threading.Lock()
+_rapid_ocr_inference_lock = threading.Lock()
+
+
 # ============================================================
 # LAZY YOLO MODEL LOADING (THREAD-SAFE)
 # ============================================================
@@ -391,6 +398,15 @@ def _build_ocr_variants(plate, prepared=None):
 
     norm_otsu_inverted = 255 - norm_otsu
 
+    adaptive = cv2.adaptiveThreshold(
+        gray,
+        255,
+        cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+        cv2.THRESH_BINARY,
+        31,
+        9,
+    )
+
     return [
         ("source-gray", source_gray, whitelist),
         ("source-color", source_color, whitelist),
@@ -399,7 +415,9 @@ def _build_ocr_variants(plate, prepared=None):
         ("fixed120", fixed_120, "--oem 3 --psm 7"),
         ("otsu-block", otsu, "--oem 3 --psm 6"),
         ("norm-otsu", norm_otsu, "--oem 3 --psm 7"),
-        ("norm-otsu-inv", norm_otsu_inverted, "--oem 3 --psm 7")
+        ("norm-otsu-inv", norm_otsu_inverted, "--oem 3 --psm 7"),
+        ("adaptive", adaptive, "--oem 3 --psm 7"),
+        ("adaptive-word", adaptive, "--oem 3 --psm 8"),
     ]
 
 
@@ -534,7 +552,89 @@ def _tesseract_read(image, config):
     return text, mean_confidence
 
 
-def ocr_plate_text(plate, prepared=None, return_confidence=False):
+def _combined_ocr_score(model_confidence, plate_score):
+    """Combine recognizer confidence with Indian plate-format validity.
+
+    The engine score alone is often pessimistic for small, compressed plate
+    crops. A strong structural match is useful evidence, but this composite
+    remains a quality score rather than a calibrated probability.
+    """
+
+    model_score = max(0.0, min(1.0, float(model_confidence or 0.0)))
+    format_score = max(0.0, min(1.0, float(plate_score or 0.0) / 10.0))
+    return 0.55 * model_score + 0.45 * format_score
+
+
+def _rapid_ocr_read(plate):
+    """Read a plate crop with local PP-OCRv6 and validate plate-shaped text."""
+
+    global _rapid_ocr
+
+    if _rapid_ocr is None:
+        with _rapid_ocr_lock:
+            if _rapid_ocr is None:
+                try:
+                    from rapidocr import RapidOCR
+
+                    _rapid_ocr = RapidOCR()
+                except Exception as error:
+                    _rapid_ocr = False
+                    logger.warning(
+                        "RapidOCR model unavailable; using Tesseract fallback: %s",
+                        error,
+                    )
+
+    if _rapid_ocr is False:
+        return "", "", 0.0
+
+    try:
+        # RapidOCR's ONNX session is shared across image/video workers. Keep
+        # inference serialized because not all execution providers are
+        # guaranteed to be thread-safe.
+        with _rapid_ocr_inference_lock:
+            result = _rapid_ocr(plate)
+
+        if result is None:
+            return "", "", 0.0
+
+        texts = [str(text).strip() for text in (result.txts or []) if str(text).strip()]
+        raw_text = " ".join(texts)
+        candidates = [
+            (candidate, score)
+            for candidate, score in find_plate_candidates(_normalize_text(raw_text))
+            if score >= 8
+        ]
+        if not candidates:
+            return "", raw_text, 0.0
+
+        candidate, _ = max(candidates, key=lambda item: item[1])
+        line_confidences = []
+        for text, confidence in zip(texts, result.scores or []):
+            # A plate may be returned as multiple text boxes (for example
+            # "TS24" + "G9737"). Match each normalized box as a substring
+            # of the assembled candidate so its recognizer confidence is
+            # included instead of incorrectly reporting zero.
+            token = _normalize_text(text)
+            if token and token in candidate:
+                try:
+                    line_confidences.append(float(confidence))
+                except (TypeError, ValueError):
+                    pass
+        # Do not borrow confidence from unrelated boxes when none belong to
+        # the selected plate candidate. A logo or nearby text can otherwise
+        # make a structurally plausible but incorrect candidate look certain
+        # and prevent the detector from retrying its tighter crop.
+        confidence = (
+            sum(line_confidences) / len(line_confidences)
+            if line_confidences else 0.0
+        )
+        return candidate, raw_text, max(0.0, min(1.0, confidence))
+    except Exception as error:
+        logger.debug("RapidOCR failed on one crop; using Tesseract fallback: %s", error)
+        return "", "", 0.0
+
+
+def ocr_plate_text(plate, prepared=None, return_confidence=False, fast=False):
     """
     Multi-variant OCR + Indian plate candidate scoring.
 
@@ -550,9 +650,34 @@ def ocr_plate_text(plate, prepared=None, return_confidence=False):
 
     candidates = {}
 
-    raw_texts = []
+    # Set ANPR_OCR_ENGINE=tesseract to return to the previous local-only
+    # reader without uninstalling RapidOCR or changing any recognition code.
+    use_rapid_ocr = os.environ.get("ANPR_OCR_ENGINE", "rapidocr").strip().lower() != "tesseract"
+    rapid_plate, rapid_raw, rapid_confidence = (
+        _rapid_ocr_read(plate) if use_rapid_ocr else ("", "", 0.0)
+    )
+    raw_texts = [f"rapidocr: {rapid_raw!r}"] if rapid_raw else []
 
-    for name, image, config in _build_ocr_variants(plate, prepared):
+    # The local plate recognizer handles the common case in one pass. Keep
+    # the multi-variant Tesseract path as a fallback for unreadable or
+    # structurally invalid model output.
+    if rapid_plate:
+        rapid_matches = list(find_plate_candidates(rapid_plate))
+        plate_score = max((score for _, score in rapid_matches), default=0)
+        combined_confidence = _combined_ocr_score(
+            rapid_confidence, plate_score
+        )
+        return (
+            (rapid_plate, raw_texts, combined_confidence)
+            if return_confidence
+            else (rapid_plate, raw_texts)
+        )
+
+    variants = _build_ocr_variants(plate, prepared)
+    if fast:
+        variants = variants[:2]
+
+    for name, image, config in variants:
 
         text, confidence = _tesseract_read(image, config)
 
@@ -602,6 +727,15 @@ def ocr_plate_text(plate, prepared=None, return_confidence=False):
                     confidence
                 )
 
+        # The two source-image passes are the strongest independent reads.
+        # When they agree on a structurally valid plate, skip six slower
+        # threshold variants; difficult or conflicting crops still use all.
+        if any(
+            entry["hits"] >= 2 and entry["support"] >= 5
+            for entry in candidates.values()
+        ):
+            break
+
     if not candidates:
 
         return ("", raw_texts, 0.0) if return_confidence else ("", raw_texts)
@@ -626,7 +760,10 @@ def ocr_plate_text(plate, prepared=None, return_confidence=False):
         return ("", raw_texts, 0.0) if return_confidence else ("", raw_texts)
 
     if return_confidence:
-        return best_plate, raw_texts, candidates[best_plate]["confidence"]
+        return best_plate, raw_texts, _combined_ocr_score(
+            candidates[best_plate]["confidence"],
+            candidates[best_plate]["score"],
+        )
     return best_plate, raw_texts
 
 
@@ -634,7 +771,7 @@ def ocr_plate_text(plate, prepared=None, return_confidence=False):
 # DETECT ALL NUMBER PLATES
 # ============================================================
 
-def detect_number_plates(image, save_artifacts=True, verbose=True):
+def detect_number_plates(image, save_artifacts=True, verbose=True, inference_size=None):
     """
     Detect all readable number plates in an image or video frame.
 
@@ -693,7 +830,7 @@ def detect_number_plates(image, save_artifacts=True, verbose=True):
     results = model(
         img,
         conf=CONFIDENCE_THRESHOLD,
-        imgsz=INFERENCE_IMG_SIZE,
+        imgsz=inference_size or INFERENCE_IMG_SIZE,
         verbose=False
     )
 
@@ -823,20 +960,35 @@ def detect_number_plates(image, save_artifacts=True, verbose=True):
                 raw_box[0]:raw_box[2]
             ]
 
-            if not plate_text and tight.size:
-                plate_text, ocr_confidence = _read_tilted_plate(tight)
-                leveled = tight
+            if tight.size and (not plate_text or ocr_confidence < 0.55):
+                tight_text, retry_texts, tight_confidence = ocr_plate_text(
+                    tight, return_confidence=True, fast=bool(plate_text)
+                )
+                raw_texts.extend(f"tight-{item}" for item in retry_texts)
+                if tight_text and (
+                    not plate_text
+                    or tight_text == plate_text
+                    or tight_confidence >= max(0.55, ocr_confidence + 0.12)
+                ):
+                    plate_text = tight_text
+                    ocr_confidence = tight_confidence
+                elif tight_text:
+                    log(
+                        "OCR crop disagreement: padded=%s (%.2f), tight=%s (%.2f)",
+                        plate_text,
+                        ocr_confidence,
+                        tight_text,
+                        tight_confidence,
+                    )
+
                 if not plate_text:
-                    leveled = _deskew_plate(tight)
-                    plate_text, retry_texts, ocr_confidence = ocr_plate_text(
-                        leveled, return_confidence=True
-                    )
-                    raw_texts.extend(f"tight-{item}" for item in retry_texts)
-                if not plate_text and leveled is not tight:
-                    plate_text, retry_texts, ocr_confidence = ocr_plate_text(
-                        tight, return_confidence=True
-                    )
-                    raw_texts.extend(f"tight-raw-{item}" for item in retry_texts)
+                    plate_text, ocr_confidence = _read_tilted_plate(tight)
+                    if not plate_text:
+                        leveled = _deskew_plate(tight)
+                        plate_text, retry_texts, ocr_confidence = ocr_plate_text(
+                            leveled, return_confidence=True
+                        )
+                        raw_texts.extend(f"tight-deskew-{item}" for item in retry_texts)
 
             for raw_text in raw_texts:
 
@@ -873,10 +1025,10 @@ def detect_number_plates(image, save_artifacts=True, verbose=True):
                     round(ocr_confidence, 4),
 
                 "bbox": (
-                    x1,
-                    y1,
-                    x2,
-                    y2
+                    raw_box[0],
+                    raw_box[1],
+                    raw_box[2],
+                    raw_box[3]
                 ),
 
                 "cropped_plate":

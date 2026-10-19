@@ -24,7 +24,8 @@ from config import (
     OUTPUT_DIR,
     VIDEO_MIN_HITS,
     VIDEO_SAMPLE_FPS,
-    VIDEO_SINGLE_HIT_CONF
+    VIDEO_SINGLE_HIT_CONF,
+    VIDEO_INFERENCE_IMG_SIZE,
 )
 from detector import detect_number_plates, preprocess_plate
 
@@ -146,7 +147,8 @@ def analyze_video(video_path, progress_callback=None, should_cancel=None):
                     detections = detect_number_plates(
                         frame,
                         save_artifacts=False,
-                        verbose=False
+                        verbose=False,
+                        inference_size=VIDEO_INFERENCE_IMG_SIZE,
                     )
 
                     for detection in detections:
@@ -193,6 +195,7 @@ def _update_group(groups, detection, frame, frame_index, seconds):
         group = {
             "hits": 0,
             "best_confidence": 0.0,
+            "best_read_quality": -1.0,
             "first_frame": frame_index,
             "sightings": [],
             "votes": {plate: 0},
@@ -207,10 +210,17 @@ def _update_group(groups, detection, frame, frame_index, seconds):
     group["last_frame"] = frame_index
 
     confidence = detection["confidence"]
+    ocr_confidence = detection.get("ocr_confidence")
+    read_quality = (
+        0.65 * float(ocr_confidence) + 0.35 * confidence
+        if ocr_confidence is not None
+        else confidence
+    )
 
-    if confidence > group["best_confidence"]:
+    if read_quality > group["best_read_quality"]:
 
         group["best_confidence"] = confidence
+        group["best_read_quality"] = read_quality
 
         group["best_detection"] = detection
 
@@ -269,6 +279,18 @@ def _finalize_groups(groups):
         detection["hits"] = group["hits"]
         detection["alternatives"] = group.get("alternatives", [plate])
         detection["match_confidence"] = group.get("match_confidence", 1.0)
+        # Multiple frames that agree on the same registration are useful
+        # evidence when the best single frame is blurry or compressed. Keep
+        # the recognizer score as the base and apply a bounded consistency
+        # bonus, weighted by how consistently the group merged.
+        base_ocr_score = float(detection.get("ocr_confidence") or 0.0)
+        agreement = max(0.0, min(1.0, float(detection["match_confidence"] or 0.0)))
+        repeat_support = max(0, int(group["hits"]) - 1)
+        repeat_bonus = min(0.20, repeat_support * 0.05) * agreement
+        detection["ocr_confidence"] = round(
+            base_ocr_score + (1.0 - base_ocr_score) * repeat_bonus,
+            4,
+        )
         detection["review_reasons"] = group.get("review_reasons", [])
 
         detection["video_time"] = round(
@@ -296,16 +318,18 @@ def _plate_distance(left, right):
 
 
 def _same_vehicle(left_plate, left, right_plate, right):
-    """Require compatible text and nearby frame locations before merging."""
-    if left_plate[:6] != right_plate[:6]:
+    """Join OCR variants only when plate boxes track the same object."""
+    if len(left_plate) != len(right_plate):
         return False
-    if _plate_distance(left_plate, right_plate) > 2:
-        return False
+    text_distance = _plate_distance(left_plate, right_plate)
 
     for left_time, left_box in left["sightings"]:
         for right_time, right_box in right["sightings"]:
-            if abs(left_time - right_time) > 1.5:
+            time_delta = abs(left_time - right_time)
+            if time_delta > 1.5:
                 continue
+            lx1, ly1, lx2, ly2 = left_box
+            rx1, ry1, rx2, ry2 = right_box
             lx = (left_box[0] + left_box[2]) / 2
             ly = (left_box[1] + left_box[3]) / 2
             rx = (right_box[0] + right_box[2]) / 2
@@ -318,7 +342,25 @@ def _same_vehicle(left_plate, left, right_plate, right):
                 left_box[3] - left_box[1],
                 right_box[3] - right_box[1],
             )
-            if abs(lx - rx) <= max(100, width * 2) and abs(ly - ry) <= max(60, height * 2):
+            close_centers = (
+                abs(lx - rx) <= max(32, width * 0.65)
+                and abs(ly - ry) <= max(24, height * 0.8)
+            )
+            intersection = max(0, min(lx2, rx2) - max(lx1, rx1)) * max(
+                0, min(ly2, ry2) - max(ly1, ry1)
+            )
+            union = (
+                (lx2 - lx1) * (ly2 - ly1)
+                + (rx2 - rx1) * (ry2 - ry1)
+                - intersection
+            )
+            overlap = intersection / union if union > 0 else 0
+            if text_distance <= 2 and close_centers:
+                return True
+            # A badly garbled frame can differ by more than two characters.
+            # Only fold it into another read when the tight plate boxes nearly
+            # overlap in adjacent sampled frames.
+            if text_distance > 2 and time_delta <= 0.7 and overlap >= 0.5:
                 return True
     return False
 
@@ -349,7 +391,11 @@ def _merge_related_groups(groups):
         members = item["members"]
         best_plate, best = max(
             members,
-            key=lambda pair: (pair[1]["best_confidence"], pair[1]["hits"]),
+            key=lambda pair: (
+                pair[1].get("best_detection", {}).get("ocr_confidence", 0.0),
+                pair[1]["best_confidence"],
+                pair[1]["hits"],
+            ),
         )
         votes = {plate: group["hits"] for plate, group in members}
         # Reread one evidence crop from *each* text variant. The most

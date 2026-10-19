@@ -1,27 +1,29 @@
 """Private, auditable operator review of uncertain ANPR observations."""
 
 import base64
+from concurrent.futures import ThreadPoolExecutor
 import json
+import logging
 import os
-import sqlite3
 import threading
 import uuid
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
-from urllib.error import URLError
+from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
-import cv2
-
-from database import read_database, save_detections
 from detector import find_plate_candidates
 
 from . import settings
+from . import db as database
+from . import storage
 
 _LOCK = threading.RLock()
+logger = logging.getLogger(__name__)
 VEHICLE_COLORS = {"Black", "White", "Silver", "Grey", "Blue", "Red", "Green", "Brown", "Yellow", "Other"}
-VEHICLE_STYLES = {"SUV", "Sedan", "Hatchback", "Van", "Truck", "Bus", "Motorcycle", "Other"}
+LOCAL_OCR_AUTO_ACCEPT_THRESHOLD = 0.94
+save_detections = database.save_detections
 
 
 def _now():
@@ -29,24 +31,20 @@ def _now():
 
 
 def _connect():
-    connection = sqlite3.connect(str(settings.REVIEW_DB), timeout=15)
-    connection.row_factory = sqlite3.Row
-    return connection
+    return database.connect(settings.REVIEW_DB, timeout=15)
 
 
 @contextmanager
 def _db():
     with _LOCK:
         connection = _connect()
-        try:
-            with connection:
-                yield connection
-        finally:
-            connection.close()
+        with database.transaction(connection):
+            yield connection
 
 
 def init_db():
-    settings.REVIEW_DB.parent.mkdir(parents=True, exist_ok=True)
+    if not database.postgres_enabled():
+        settings.REVIEW_DB.parent.mkdir(parents=True, exist_ok=True)
     with _db() as connection:
         connection.execute("""
             CREATE TABLE IF NOT EXISTS reviews (
@@ -71,13 +69,18 @@ def init_db():
                 hits INTEGER,
                 video_time REAL,
                 reviewer TEXT,
-                reviewed_at TEXT
+                reviewed_at TEXT,
+                vehicle_color TEXT
             )
         """)
-        columns = {row["name"] for row in connection.execute("PRAGMA table_info(reviews)")}
-        for column in ("vehicle_color", "suggested_color", "suggested_style"):
-            if column not in columns:
-                connection.execute(f"ALTER TABLE reviews ADD COLUMN {column} TEXT")
+        if database.is_postgres(connection):
+            connection.execute(
+                "ALTER TABLE reviews ADD COLUMN IF NOT EXISTS vehicle_color TEXT"
+            )
+        else:
+            columns = {row["name"] for row in connection.execute("PRAGMA table_info(reviews)")}
+            if "vehicle_color" not in columns:
+                connection.execute("ALTER TABLE reviews ADD COLUMN vehicle_color TEXT")
 
 
 def _gemini_read(crop_path, key):
@@ -114,7 +117,22 @@ def _gemini_read(crop_path, key):
         candidates = list(find_plate_candidates(cleaned))
         exact = [candidate for candidate, score in candidates if len(candidate) == len(cleaned) and score >= 7]
         return "Gemini 3.8 Flash", exact[0] if exact else None
+    except HTTPError as error:
+        try:
+            response = json.loads(error.read().decode("utf-8", "replace"))
+            message = str(response.get("error", {}).get("message", ""))
+        except (ValueError, AttributeError):
+            message = ""
+        if "denied access" in message.lower():
+            reason = "project access denied"
+        elif error.code in {401, 403}:
+            reason = "API key or project permission denied"
+        else:
+            reason = f"HTTP {error.code}"
+        logger.warning("Gemini request rejected (%s): %s", reason, message[:240])
+        return f"Gemini unavailable: {reason}", None
     except (OSError, ValueError, KeyError, IndexError, URLError, TimeoutError):
+        logger.exception("Gemini request failed")
         return "Gemini 3.8 Flash (unavailable)", None
 
 
@@ -155,63 +173,29 @@ def _provider_read(crop_path):
     vision_key = os.environ.get("ANPR_GOOGLE_VISION_API_KEY", "").strip()
     if vision_key:
         return _vision_read(crop_path, vision_key)
-    return None, None
+    return "Gemini not configured", None
 
 
-def _gemini_vehicle_attributes(frame_path, bbox):
-    """Describe visible vehicle appearance in a frame with the plate masked."""
-    key = settings.get_gemini_key()
-    if not key or not frame_path or not bbox or len(bbox) != 4:
-        return None, None
+def _safe_provider_read(crop_path):
+    """Keep provider failures isolated to one observation."""
     try:
-        frame = cv2.imread(str(frame_path))
-        if frame is None:
-            return None, None
-        height, width = frame.shape[:2]
-        x1, y1, x2, y2 = [int(value) for value in bbox]
-        if not (0 <= x1 < x2 <= width and 0 <= y1 < y2 <= height):
-            return None, None
-        pad_x, pad_y = max(8, (x2 - x1) // 5), max(8, (y2 - y1) // 2)
-        cv2.rectangle(frame, (max(0, x1 - pad_x), max(0, y1 - pad_y)),
-                      (min(width, x2 + pad_x), min(height, y2 + pad_y)), (0, 0, 0), -1)
-        scale = min(1.0, 1024 / max(width, height))
-        if scale < 1:
-            frame = cv2.resize(frame, None, fx=scale, fy=scale, interpolation=cv2.INTER_AREA)
-        ok, encoded_frame = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 78])
-        if not ok:
-            return None, None
-        payload = json.dumps({
-            "contents": [{"parts": [
-                {"text": (
-                    "Describe only the vehicle associated with the blacked-out number plate. "
-                    "Return JSON with color and body_style. Use color from Black, White, Silver, Grey, "
-                    "Blue, Red, Green, Brown, Yellow, Other, or Unknown. Use body_style from SUV, "
-                    "Sedan, Hatchback, Van, Truck, Bus, Motorcycle, Other, or Unknown. "
-                    "If the vehicle is not clearly visible, return Unknown. Do not infer registration, "
-                    "make, model, route, or location."
-                )},
-                {"inline_data": {"mime_type": "image/jpeg", "data": base64.b64encode(encoded_frame.tobytes()).decode("ascii")}},
-            ]}],
-            "generationConfig": {"temperature": 0, "responseMimeType": "application/json", "maxOutputTokens": 256},
-        }).encode("utf-8")
-        request = Request(
-            "https://generativelanguage.googleapis.com/v1beta/models/gemini-3.8-flash:generateContent",
-            data=payload,
-            headers={"Content-Type": "application/json", "x-goog-api-key": key},
-            method="POST",
-        )
-        with urlopen(request, timeout=15) as response:
-            data = json.load(response)
-        raw = "".join(part.get("text", "") for part in data.get("candidates", [{}])[0].get("content", {}).get("parts", []))
-        attributes = json.loads(raw)
-        color = str(attributes.get("color", "")).strip().title()
-        if color == "Gray":
-            color = "Grey"
-        style_name = str(attributes.get("body_style", "")).strip().lower()
-        style = "SUV" if style_name == "suv" else style_name.title()
-        return color if color in VEHICLE_COLORS else None, style if style in VEHICLE_STYLES else None
-    except (OSError, ValueError, TypeError, KeyError, IndexError, URLError, TimeoutError):
+        return _provider_read(crop_path)
+    except Exception:
+        logger.exception("Second plate reader failed")
         return None, None
+
+
+def _provider_read_for_detection(detection):
+    """Skip Gemini only when the local OCR score exceeds the auto-save threshold."""
+    try:
+        ocr_score = float(detection.get("ocr_confidence"))
+    except (TypeError, ValueError):
+        ocr_score = 0.0
+
+    if ocr_score > LOCAL_OCR_AUTO_ACCEPT_THRESHOLD:
+        return "Skipped: local OCR >94%; Gemini not called", None
+
+    return _safe_provider_read(detection.get("cropped_plate"))
 
 
 def _row_dict(row):
@@ -230,11 +214,39 @@ def ingest(detections):
     init_db()
     created = []
     saved_count = 0
-    with _db() as connection:
+    if detections:
+        # Do provider I/O before taking the review database lock. Bounded
+        # concurrency keeps video batches responsive without flooding APIs.
+        with ThreadPoolExecutor(max_workers=min(4, len(detections))) as pool:
+            provider_results = list(pool.map(
+                _provider_read_for_detection,
+                detections,
+            ))
+    else:
+        provider_results = []
+
+    if database.postgres_enabled():
+        if not storage.configured():
+            raise RuntimeError(
+                "Supabase Storage is not configured; evidence cannot be persisted."
+            )
         for detection in detections:
+            for field in ("image_path", "cropped_plate"):
+                local_path = detection.get(field)
+                if local_path:
+                    reference = storage.upload_file(local_path)
+                    if reference:
+                        detection[field] = reference
+
+    with _db() as connection:
+        for detection, (provider, provider_read) in zip(detections, provider_results):
             prediction = detection["plate_number"]
             detector_score = float(detection.get("confidence", 0))
             ocr_score = detection.get("ocr_confidence")
+            local_ocr_auto_accept = (
+                ocr_score is not None
+                and float(ocr_score) > LOCAL_OCR_AUTO_ACCEPT_THRESHOLD
+            )
             match_score = detection.get("match_confidence")
             reasons = list(detection.get("review_reasons", []))
             if detector_score < .5:
@@ -246,17 +258,27 @@ def ingest(detections):
             if detection.get("video_time") is not None and detection.get("hits", 0) < 2:
                 reasons.append("Plate read in only one sampled video frame")
 
-            provider, provider_read = (None, None)
-            if reasons:
-                provider, provider_read = _provider_read(detection.get("cropped_plate"))
-                if provider_read and provider_read != prediction:
-                    reasons.append("Second OCR reader disagrees")
+            if not local_ocr_auto_accept:
+                gemini_configured = bool(settings.get_gemini_key())
+                if not gemini_configured:
+                    reasons.append("Gemini plate verification is not configured")
+                elif provider != "Gemini 3.8 Flash" or not provider_read:
+                    reasons.append("Gemini plate reading unavailable")
 
-            gemini_agrees = provider == "Gemini 3.8 Flash" and provider_read == prediction
-            status = "accepted" if not reasons or gemini_agrees else "pending"
-            suggested_color, suggested_style = (
-                _gemini_vehicle_attributes(detection.get("image_path"), detection.get("bbox"))
-                if status == "pending" else (None, None)
+            # A local OCR quality score above 94% can bypass Gemini. Lower
+            # scores require an agreeing Gemini read; disagreement or provider
+            # failure keeps the observation in the operator review queue.
+            if provider_read and provider_read != prediction:
+                reasons.append("Gemini plate read disagrees")
+
+            gemini_agrees = (
+                provider == "Gemini 3.8 Flash"
+                and provider_read == prediction
+            )
+            status = (
+                "accepted"
+                if local_ocr_auto_accept or gemini_agrees
+                else "pending"
             )
             review_id = uuid.uuid4().hex
             if status == "accepted":
@@ -267,8 +289,8 @@ def ingest(detections):
                     detector_score, ocr_score, match_score, alternatives, reasons,
                     provider, provider_read, camera_id, location, observed_at,
                     image_path, crop_path, source_name, hits, video_time,
-                    reviewer, reviewed_at, suggested_color, suggested_style
-                ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                    reviewer, reviewed_at
+                ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
             """, (
                 review_id, _now(), status, prediction,
                 prediction if status == "accepted" else None,
@@ -279,7 +301,7 @@ def ingest(detections):
                 detection["timestamp"], detection["image_path"],
                 detection.get("cropped_plate"), detection.get("source_name"),
                 detection.get("hits"), detection.get("video_time"),
-                None, None, suggested_color, suggested_style,
+                None, None,
             ))
             created.append({
                 **detection,
@@ -288,8 +310,6 @@ def ingest(detections):
                 "review_reasons": reasons,
                 "provider": provider,
                 "provider_read": provider_read,
-                "suggested_color": suggested_color,
-                "suggested_style": suggested_style,
             })
     return {"detections": created, "saved_count": saved_count,
             "pending_count": sum(item["review_status"] == "pending" for item in created)}
@@ -302,7 +322,11 @@ def list_pending():
             "SELECT * FROM reviews WHERE status = 'pending' ORDER BY created_at DESC LIMIT 100"
         ).fetchall()
     items = [_row_dict(row) for row in rows]
-    history = read_database()
+    if not settings.get_gemini_key():
+        for item in items:
+            if item.get("provider") is None:
+                item["provider"] = "Gemini not configured"
+    history = database.read_detections()
     if history.empty:
         return items
     # These are context suggestions, never automatic identity matches.
@@ -359,14 +383,23 @@ def decide(review_id, action, plate, reviewer, vehicle_color=None):
             raise ValueError("This observation has already been reviewed.")
         if action == "confirm":
             normalized = "".join(char for char in plate.upper() if char.isalnum())
-            if not 8 <= len(normalized) <= 12 or normalized != plate.strip().upper():
-                raise ValueError("Enter a valid registration without spaces or symbols.")
+            valid_plate = any(
+                candidate == normalized and score >= 5
+                for candidate, score in find_plate_candidates(normalized)
+            )
+            if (
+                not 8 <= len(normalized) <= 11
+                or normalized != plate.strip().upper()
+                or not valid_plate
+            ):
+                raise ValueError("Enter a valid Indian registration without spaces or symbols.")
             save_detections([{
                 "plate_number": normalized,
                 "image_path": row["image_path"],
                 "camera_id": row["camera_id"],
                 "location": row["location"],
                 "confidence": row["detector_score"],
+                "timestamp": row["observed_at"],
             }])
             status = "confirmed"
         else:

@@ -12,6 +12,7 @@ import {
 import L from 'leaflet'
 import 'leaflet/dist/leaflet.css'
 import { gsap, prefersReducedMotion } from '../lib/motion'
+import { activityLevelClass } from '../lib/format'
 
 const TILE_URL =
   'https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png'
@@ -21,12 +22,22 @@ const TILE_ATTRIBUTION =
 
 const HYDERABAD_CENTER = [17.4948, 78.42]
 
+function escapeHtml(value) {
+  return String(value || '').replace(/[&<>"']/g, (character) => ({
+    '&': '&amp;',
+    '<': '&lt;',
+    '>': '&gt;',
+    '"': '&quot;',
+    "'": '&#39;',
+  })[character])
+}
+
 function cameraIcon(camera) {
   const html = `
     <div class="cam-marker">
       <span class="cam-marker__pulse"></span>
       <span class="cam-marker__core"></span>
-      <span class="cam-marker__label">${camera.id}</span>
+      <span class="cam-marker__label">${escapeHtml(camera.location || camera.id)}</span>
     </div>
   `
 
@@ -73,10 +84,16 @@ export function CameraMap({ cameras = [], stats = [], children, tall, selectedId
               <Tooltip direction="top" offset={[0, -12]} className="cam-tooltip">
                 <strong>{camera.id}</strong> · {camera.location}
                 {stat && (
-                  <span className="cam-tooltip__meta">
-                    {stat.observations} recorded observation
-                    {stat.observations === 1 ? '' : 's'}
-                  </span>
+                  <>
+                    <span className="cam-tooltip__meta">
+                      {stat.observations} recorded observation
+                      {stat.observations === 1 ? '' : 's'}
+                    </span>
+                    <span className={`cam-tooltip__activity ${activityLevelClass(stat.traffic_level)}`}>
+                      <span className="level__dot" />
+                      Traffic estimate: {stat.traffic_level}
+                    </span>
+                  </>
                 )}
               </Tooltip>
             </Marker>

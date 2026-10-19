@@ -2,6 +2,22 @@ import os
 import shutil
 
 
+def _positive_float(name, default):
+    try:
+        value = float(os.environ.get(name, default))
+        return value if value > 0 else float(default)
+    except (TypeError, ValueError):
+        return float(default)
+
+
+def _positive_int(name, default):
+    try:
+        value = int(os.environ.get(name, default))
+        return value if value > 0 else int(default)
+    except (TypeError, ValueError):
+        return int(default)
+
+
 # ============================================================
 # PROJECT PATHS (ANCHORED TO THIS FILE, NOT THE CWD)
 # ============================================================
@@ -53,7 +69,11 @@ PADDING_Y = 30
 # ============================================================
 
 # Frames analyzed per second of video (1-3 is a good range).
-VIDEO_SAMPLE_FPS = 3.0
+VIDEO_SAMPLE_FPS = _positive_float("ANPR_VIDEO_SAMPLE_FPS", 3.0)
+
+# A smaller detector input makes uploaded-video analysis substantially
+# faster while retaining the full resolution for plate crops and evidence.
+VIDEO_INFERENCE_IMG_SIZE = _positive_int("ANPR_VIDEO_INFERENCE_IMG_SIZE", 1280)
 
 # A plate must be read in at least this many analyzed frames
 # to be accepted as a vehicle in the video.

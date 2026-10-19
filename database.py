@@ -126,10 +126,16 @@ def _build_record(
     image_path,
     camera_id,
     location,
-    confidence
+    confidence,
+    observed_at=None,
 ):
 
-    now = datetime.now()
+    try:
+        now = datetime.strptime(
+            str(observed_at or ""), "%Y-%m-%d %H:%M:%S"
+        )
+    except ValueError:
+        now = datetime.now()
 
     return {
 
@@ -229,6 +235,20 @@ def read_database():
         _CACHE["frame"] = normalized
 
         return normalized
+
+
+def clear_detections():
+    """Remove all CSV observations while preserving the empty schema."""
+
+    with _WRITE_LOCK:
+        current = read_database()
+        count = len(current.index)
+        directory = os.path.dirname(DATABASE_FILE)
+        if directory:
+            os.makedirs(directory, exist_ok=True)
+        _atomic_write_csv(pd.DataFrame(columns=COLUMN_ORDER))
+        _invalidate_cache()
+        return count
 
 
 # ============================================================
@@ -349,7 +369,8 @@ def save_detections(detections):
             detection.get("image_path", ""),
             detection.get("camera_id", "CAM-01"),
             detection.get("location", "Unknown"),
-            detection.get("confidence", 0.0)
+            detection.get("confidence", 0.0),
+            detection.get("timestamp") or detection.get("observed_at"),
         )
         for detection in detections
     ]

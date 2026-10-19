@@ -13,6 +13,7 @@ are exposed exclusively through authenticated endpoints.
 """
 
 import math
+import logging
 import os
 from datetime import datetime
 from pathlib import Path
@@ -20,7 +21,6 @@ from pathlib import Path
 from analytics import (
     active_camera_count,
     camera_statistics,
-    multi_camera_vehicles,
     traffic_activity,
     unique_plate_count,
     valid_detections,
@@ -30,7 +30,9 @@ from config import (
     CAMERA_LOCATION_BY_ID,
     OUTPUT_DIR,
 )
-from database import read_database
+from . import db as database, settings
+
+logger = logging.getLogger(__name__)
 
 _DATE_FORMAT = "%d-%m-%Y"
 _TIME_FORMAT = "%I:%M:%S %p"
@@ -108,7 +110,7 @@ def _normalize_row(row):
 def _records():
     """Valid detection records as plain dicts (newest last)."""
 
-    frame = read_database()
+    frame = database.read_detections()
 
     if frame.empty:
 
@@ -142,12 +144,49 @@ def _display_timestamp(parsed):
     return parsed.strftime("%d %b %Y · %H:%M")
 
 
+def _plausible_route(events):
+    """Return every timestamped, known-camera sighting in chronological order.
+
+    Camera revisits remain separate route points, so trajectories such as
+    CAM-02 -> CAM-03 -> CAM-02 -> CAM-01 are drawn in their recorded order.
+    The map line visualizes recorded observations; it is not a verified road
+    route or proof that the vehicle traveled between cameras.
+    """
+    timed = [
+        event for event in events
+        if event["parsed"] is not None and event["camera_id"] in CAMERA_BY_ID
+    ]
+    timed.sort(key=lambda event: event["parsed"])
+    return {
+        "events": timed,
+        "camera_path": [event["camera_id"] for event in timed],
+    }
+
+
+def _multi_camera_routes(groups):
+    """Return only plate histories with a plausible multi-camera chain."""
+    routes = []
+    for plate, events in groups.items():
+        route = _plausible_route(events)
+        if len(set(route["camera_path"])) > 1:
+            routes.append({
+                "plate": plate,
+                "cameras": route["camera_path"],
+                "events": events,
+            })
+    return routes
+
+
 def _evidence_name(image_path):
     """Return the evidence filename when it lives in output/."""
 
     if not image_path:
 
         return None
+
+    if str(image_path).startswith("storage://"):
+
+        return str(image_path)[len("storage://"):]
 
     absolute = os.path.abspath(str(image_path))
 
@@ -184,9 +223,7 @@ def public_summary():
         "unique_vehicles": unique_plate_count(records),
         "active_cameras": active_camera_count(records),
         "total_cameras": len(CAMERA_BY_ID),
-        "multi_camera_vehicles": len(
-            multi_camera_vehicles(_trajectory_index(records))
-        ),
+        "multi_camera_vehicles": len(_multi_camera_routes(_trajectory_index(records))),
         "traffic_activity": traffic_activity(records),
         "first_seen": _display_timestamp(first_seen),
         "last_seen": _display_timestamp(last_seen),
@@ -204,6 +241,11 @@ def public_camera_stats():
             "camera_id": camera_id,
             "location": CAMERA_LOCATION_BY_ID.get(camera_id, "Unknown"),
             "observations": count,
+            "traffic_level": (
+                "LOW" if count <= 2 else
+                "MEDIUM" if count <= 5 else
+                "HIGH"
+            ),
         }
         for camera_id, count in stats.items()
     ]
@@ -464,30 +506,15 @@ def vehicle_trajectory(plate):
 
         return None
 
-    polyline = []
-
-    camera_path = []
-
-    for event in events:
-
-        camera = CAMERA_BY_ID.get(event["camera_id"])
-
-        if camera is None:
-
-            continue
-
-        point = [
-            camera["coordinates"]["lat"],
-            camera["coordinates"]["lon"]
+    route = _plausible_route(events)
+    camera_path = route["camera_path"]
+    polyline = [
+        [
+            CAMERA_BY_ID[camera_id]["coordinates"]["lat"],
+            CAMERA_BY_ID[camera_id]["coordinates"]["lon"],
         ]
-
-        if not polyline or polyline[-1] != point:
-
-            polyline.append(point)
-
-        if not camera_path or camera_path[-1] != event["camera_id"]:
-
-            camera_path.append(event["camera_id"])
+        for camera_id in camera_path
+    ]
 
     parsed_events = [
         event for event in events if event["parsed"] is not None
@@ -501,9 +528,10 @@ def vehicle_trajectory(plate):
         "polyline": polyline,
         "camera_path": camera_path,
         "multi_camera": len(camera_path) > 1,
+        "route_established": len(camera_path) > 1,
         "summary": {
             "observations": len(events),
-            "cameras": len(camera_path),
+            "cameras": len(set(camera_path)),
             "first_seen": _display_timestamp(
                 parsed_events[0]["parsed"]
             ) if parsed_events else "",
@@ -518,34 +546,39 @@ def multi_camera_list():
 
     groups = _trajectory_index()
 
-    vehicles = multi_camera_vehicles(groups)
-
     rows = []
 
-    for vehicle in vehicles:
-
-        events = vehicle["events"]
+    for plate, events in groups.items():
+        route = _plausible_route(events)
+        camera_path = route["camera_path"]
+        camera_count = len(set(camera_path))
+        if camera_count < 2:
+            continue
 
         parsed = [
             event["parsed"] for event in events
             if event["parsed"] is not None
         ]
+        last_seen_at = max(parsed) if parsed else datetime.min
 
         rows.append(
             {
-                "plate": vehicle["plate"],
-                "cameras": vehicle["cameras"],
-                "camera_count": len(vehicle["cameras"]),
+                "plate": plate,
+                "cameras": camera_path,
+                "camera_count": camera_count,
                 "observations": len(events),
-                "last_seen": _display_timestamp(max(parsed))
+                "last_seen": _display_timestamp(last_seen_at)
                 if parsed else "",
+                "_last_seen_at": last_seen_at,
             }
         )
 
     rows.sort(
-        key=lambda row: row["observations"],
-        reverse=True
+        key=lambda row: (row["_last_seen_at"], row["observations"]),
+        reverse=True,
     )
+    for row in rows:
+        row.pop("_last_seen_at", None)
 
     return rows
 
@@ -609,3 +642,95 @@ def evidence_path(filename):
         return None
 
     return candidate
+
+
+def clear_operational_data():
+    """Clear detections and reviews, retaining operator accounts."""
+
+    stored_objects = set()
+    local_evidence = set()
+
+    def collect_image(value):
+        if not value:
+            return
+        value = str(value)
+        if value.startswith("storage://"):
+            stored_objects.add(value[len("storage://"):])
+            return
+        candidate = Path(value).resolve()
+        output_root = Path(OUTPUT_DIR).resolve()
+        if candidate.is_relative_to(output_root) and candidate.is_file():
+            local_evidence.add(candidate)
+
+    connection = database.connect(settings.REVIEW_DB)
+    try:
+        with connection:
+            review_rows = connection.execute(
+                "SELECT image_path, crop_path FROM reviews"
+            ).fetchall()
+            for row in review_rows:
+                collect_image(row["image_path"])
+                collect_image(row["crop_path"])
+
+            if database.is_postgres(connection):
+                detection_rows = connection.execute(
+                    "SELECT image_path FROM detections"
+                ).fetchall()
+                detection_count = connection.execute(
+                    "SELECT COUNT(*) AS count FROM detections"
+                ).fetchone()["count"]
+                review_count = connection.execute(
+                    "SELECT COUNT(*) AS count FROM reviews"
+                ).fetchone()["count"]
+                for row in detection_rows:
+                    collect_image(row["image_path"])
+                connection.execute("DELETE FROM detections")
+            else:
+                import database as csv_database
+
+                frame = csv_database.read_database()
+                detection_count = len(frame.index)
+                review_count = len(review_rows)
+                if not frame.empty and "Image Path" in frame:
+                    for value in frame["Image Path"].tolist():
+                        collect_image(value)
+
+            connection.execute("DELETE FROM reviews")
+    finally:
+        connection.close()
+
+    if not database.postgres_enabled():
+        import database as csv_database
+
+        csv_database.clear_detections()
+
+    evidence_deleted = 0
+    evidence_cleanup_complete = True
+    for path in local_evidence:
+        try:
+            path.unlink(missing_ok=True)
+            evidence_deleted += 1
+        except OSError:
+            evidence_cleanup_complete = False
+
+    if stored_objects:
+        from . import storage
+
+        if not storage.configured():
+            evidence_cleanup_complete = False
+        else:
+            names = sorted(stored_objects)
+            try:
+                for start in range(0, len(names), 100):
+                    storage.delete_objects(names[start:start + 100])
+                    evidence_deleted += len(names[start:start + 100])
+            except RuntimeError:
+                logger.warning("Evidence cleanup was incomplete after records were cleared.")
+                evidence_cleanup_complete = False
+
+    return {
+        "reviews_deleted": review_count,
+        "detections_deleted": detection_count,
+        "evidence_deleted": evidence_deleted,
+        "evidence_cleanup_complete": evidence_cleanup_complete,
+    }

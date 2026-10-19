@@ -993,8 +993,9 @@ select {
   left: 50%;
   transform: translateX(-50%);
   font-family: var(--font-mono);
-  font-size: 9.5px;
-  letter-spacing: 0.08em;
+  font-family: var(--font-sans);
+  font-size: 10px;
+  letter-spacing: 0.01em;
   color: var(--text);
   background: rgba(10, 14, 21, 0.85);
   border: 1px solid var(--border-strong);
@@ -1028,6 +1029,17 @@ select {
   color: var(--text-3);
   font-family: var(--font-mono);
   font-size: 11px;
+}
+
+.cam-tooltip .cam-tooltip__activity {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  margin-top: 7px;
+  color: var(--text-2);
+  font-family: var(--font-mono);
+  font-size: 10px;
+  letter-spacing: .04em;
 }
 
 /* ============================================================

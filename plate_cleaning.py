@@ -49,7 +49,7 @@ def fix_plate_characters(plate_text):
     Texts with an unexpected length are returned unchanged.
     """
 
-    if not 8 <= len(plate_text) <= 10:
+    if not 8 <= len(plate_text) <= 11:
 
         return plate_text
 
@@ -193,7 +193,7 @@ def find_plate_candidates(cleaned_text):
     """
     Yield (plate, score) candidates mined from one OCR text.
 
-    Every 8-10 character window is corrected, its state code is
+    Every 8-11 character window is corrected, its state code is
     snapped to a valid one, and it is scored on Indian-plate
     structure. Candidates are penalized for characters that had
     to be corrected and for surrounding text the window does not
@@ -209,6 +209,8 @@ def find_plate_candidates(cleaned_text):
 
     text_length = len(cleaned_text)
 
+    candidates = []
+
     # --------------------------------------------------------
     # Bharat (BH) series:  YY BH NNNN LL
     # --------------------------------------------------------
@@ -218,13 +220,13 @@ def find_plate_candidates(cleaned_text):
         cleaned_text
     ):
 
-        yield match.group(0), 10
+        candidates.append((match.group(0), 10))
 
     # --------------------------------------------------------
     # Classic format windows
     # --------------------------------------------------------
 
-    for length in (10, 9, 8):
+    for length in (11, 10, 9, 8):
 
         if text_length < length:
 
@@ -298,4 +300,11 @@ def find_plate_candidates(cleaned_text):
 
             score -= unexplained
 
-            yield plate, score
+            candidates.append((plate, score))
+
+    # Stable ranking matters because callers often display candidates in
+    # generator order. When OCR scores tie, prefer the shorter complete
+    # plate window, which avoids keeping trailing scene text as a plate
+    # character. The unexplained-character penalty still favors a longer
+    # read whenever it has stronger evidence.
+    yield from sorted(candidates, key=lambda item: (-item[1], len(item[0]), item[0]))

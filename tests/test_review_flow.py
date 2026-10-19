@@ -4,6 +4,7 @@ import sys
 import base64
 import io
 import json
+import pytest
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from unittest.mock import patch
@@ -17,6 +18,7 @@ from app.main import app
 from fastapi.testclient import TestClient
 import cv2
 import numpy as np
+from detector import ocr_plate_text
 from video import _finalize_groups, _merge_related_groups
 from processing import process_images
 
@@ -63,6 +65,7 @@ def test_matching_gemini_read_accepts_without_human_review():
             "cropped_plate": str(Path(directory) / "crop.jpg"),
         }
         with patch.object(settings, "REVIEW_DB", Path(directory) / "reviews.db"), \
+             patch.object(settings, "get_gemini_key", return_value="test-key"), \
              patch.object(review, "_provider_read", return_value=("Gemini 3.8 Flash", "TS08GH5405")), \
              patch.object(review, "save_detections", return_value=1) as save:
             result = review.ingest([detection])
@@ -83,6 +86,7 @@ def test_disagreeing_gemini_read_stays_pending():
             "cropped_plate": str(Path(directory) / "crop.jpg"),
         }
         with patch.object(settings, "REVIEW_DB", Path(directory) / "reviews.db"), \
+             patch.object(settings, "get_gemini_key", return_value="test-key"), \
              patch.object(review, "_provider_read", return_value=("Gemini 3.8 Flash", "TS08GH5406")), \
              patch.object(review, "save_detections", return_value=1) as save:
             result = review.ingest([detection])
@@ -92,38 +96,71 @@ def test_disagreeing_gemini_read_stays_pending():
             save.assert_not_called()
 
 
-def test_gemini_appearance_masks_plate_and_stores_review_context():
+def test_gemini_reads_only_the_plate_and_does_not_infer_vehicle_attributes():
     with TemporaryDirectory() as directory:
-        frame_path = Path(directory) / "frame.jpg"
-        cv2.imwrite(str(frame_path), np.full((100, 200, 3), 220, dtype=np.uint8))
-        response = {"candidates": [{"content": {"parts": [
-            {"text": json.dumps({"color": "blue", "body_style": "SUV"})}
-        ]}}]}
+        crop_path = Path(directory) / "crop.jpg"
+        crop_path.write_bytes(b"plate crop")
+        response = {"candidates": [{"content": {"parts": [{"text": "TS08GH5405"}]}}]}
         with patch.object(settings, "get_gemini_key", return_value="test-key"), \
              patch.object(review, "urlopen", return_value=io.BytesIO(json.dumps(response).encode())) as send:
-            attributes = review._gemini_vehicle_attributes(frame_path, (60, 40, 100, 60))
-        assert attributes == ("Blue", "SUV")
+            assert review._provider_read(crop_path) == ("Gemini 3.8 Flash", "TS08GH5405")
         payload = json.loads(send.call_args.args[0].data)
-        encoded = payload["contents"][0]["parts"][1]["inline_data"]["data"]
-        masked = cv2.imdecode(np.frombuffer(base64.b64decode(encoded), dtype=np.uint8), cv2.IMREAD_COLOR)
-        assert masked[50, 80].max() < 10
+        prompt = payload["contents"][0]["parts"][0]["text"].lower()
+        assert "registration" in prompt or "number plate" in prompt
+        assert "body_style" not in prompt
+        assert "color" not in prompt
 
         detection = {
             "plate_number": "TS08GH5405", "confidence": .4, "ocr_confidence": .3,
             "camera_id": "CAM-01", "location": "Hyderabad",
-            "timestamp": "2026-10-10 12:00:00", "image_path": str(frame_path),
-            "cropped_plate": None, "bbox": (60, 40, 100, 60),
+            "timestamp": "2026-10-10 12:00:00", "image_path": "frame.jpg",
+            "cropped_plate": str(crop_path),
         }
         with patch.object(settings, "REVIEW_DB", Path(directory) / "reviews.db"), \
-             patch.object(review, "_gemini_vehicle_attributes", return_value=("Blue", "SUV")), \
+             patch.object(settings, "get_gemini_key", return_value="test-key"), \
+             patch.object(review, "_provider_read", return_value=("Gemini 3.8 Flash", "TS08GH5405")), \
              patch.object(review, "save_detections", return_value=1) as save:
             result = review.ingest([detection])
-            assert result["pending_count"] == 1
-            item = review.list_pending()[0]
-            assert (item["suggested_color"], item["suggested_style"]) == ("Blue", "SUV")
-            decided = review.decide(item["id"], "confirm", "TS08GH5405", "operator.cop@example.com", "Blue")
-            assert decided["vehicle_color"] == "Blue"
+            assert result["pending_count"] == 0
+            assert result["detections"][0]["review_status"] == "accepted"
             save.assert_called_once()
+
+
+def test_gemini_disagreement_requires_review_even_when_local_scores_are_high():
+    with TemporaryDirectory() as directory:
+        detection = {
+            "plate_number": "TS08GH5405", "confidence": .9,
+            "ocr_confidence": .9, "camera_id": "CAM-01",
+            "location": "Hyderabad", "timestamp": "2026-10-10 12:00:00",
+            "image_path": "frame.jpg", "cropped_plate": "crop.jpg",
+        }
+        with patch.object(settings, "REVIEW_DB", Path(directory) / "reviews.db"), \
+             patch.object(settings, "get_gemini_key", return_value="test-key"), \
+             patch.object(review, "_provider_read", return_value=("Gemini 3.8 Flash", "TS08GH5406")) as read, \
+             patch.object(review, "save_detections", return_value=1) as save:
+            result = review.ingest([detection])
+        read.assert_called_once_with("crop.jpg")
+        assert result["pending_count"] == 1
+        assert "Gemini plate read disagrees" in result["detections"][0]["review_reasons"]
+        save.assert_not_called()
+
+
+def test_high_local_confidence_is_accepted_without_gemini():
+    with TemporaryDirectory() as directory:
+        detection = {
+            "plate_number": "TS08GH5405", "confidence": .95,
+            "ocr_confidence": .95, "camera_id": "CAM-01",
+            "location": "Hyderabad", "timestamp": "2026-10-10 12:00:00",
+            "image_path": "frame.jpg", "cropped_plate": "crop.jpg",
+        }
+        with patch.object(settings, "REVIEW_DB", Path(directory) / "reviews.db"), \
+             patch.object(settings, "get_gemini_key", return_value=""), \
+             patch.object(review, "_provider_read", return_value=("Gemini not configured", None)), \
+             patch.object(review, "save_detections", return_value=1) as save:
+            result = review.ingest([detection])
+        assert result["pending_count"] == 0
+        assert result["detections"][0]["review_status"] == "accepted"
+        save.assert_called_once()
 
 
 def test_video_variants_join_only_when_sightings_are_nearby():
@@ -138,11 +175,51 @@ def test_video_variants_join_only_when_sightings_are_nearby():
     groups = {
         "UK07BS4542": group("UK07BS4542", 1.0, 50),
         "UK07BS2542": group("UK07BS2542", 1.3, 70),
+        # OCR can confuse state/district characters too, not only the suffix.
+        "UK17BS4542": group("UK17BS4542", 1.3, 65),
         "UK07BS4543": group("UK07BS4543", 1.3, 900),
     }
     merged = _merge_related_groups(groups)
     assert len(merged) == 2
-    assert sorted(group["hits"] for _, group in merged) == [2, 4]
+    assert sorted(group["hits"] for _, group in merged) == [2, 6]
+
+
+def test_video_tracker_uses_tight_plate_box_for_bad_ocr_variants():
+    def group(plate, time, x=100):
+        return {
+            "hits": 1, "first_frame": int(time * 30),
+            "best_confidence": .8,
+            "best_detection": {"plate_number": plate},
+            "sightings": [(time, (x, 80, x + 60, 100))],
+        }
+
+    groups = {
+        "TS08GH5405": group("TS08GH5405", 1.0),
+        "MH12AB1234": group("MH12AB1234", 1.3),
+        "DL75AD2330": group("DL75AD2330", 1.3, 900),
+    }
+    merged = _merge_related_groups(groups)
+    # The first pair has the same tight box in adjacent frames despite a
+    # badly corrupted OCR string; the distant third read stays separate.
+    assert len(merged) == 2
+    assert sorted(group["hits"] for _, group in merged) == [1, 2]
+
+
+def test_ocr_skips_slow_variants_when_natural_reads_agree():
+    variants = [
+        (name, object(), "") for name in (
+            "source-gray", "source-color", "fixed150", "otsu",
+            "fixed120", "otsu-block", "norm-otsu", "norm-otsu-inv",
+        )
+    ]
+    with patch("detector._build_ocr_variants", return_value=variants), \
+         patch("detector._tesseract_read", return_value=("TS08GH5405", .8)) as read:
+        plate, _, confidence = ocr_plate_text(np.zeros((20, 50, 3), dtype=np.uint8), return_confidence=True)
+    assert plate == "TS08GH5405"
+    # Reported OCR confidence combines recognizer confidence and plate-format
+    # evidence; this valid full-format read scores 0.89 after calibration.
+    assert confidence == pytest.approx(.89)
+    assert read.call_count == 2
 
 
 def test_authenticated_batch_upload_route():

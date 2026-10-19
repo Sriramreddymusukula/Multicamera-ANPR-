@@ -43,7 +43,7 @@ function ReviewItem({ item, onDecide }) {
 
         <div className="review-item__scores">
           <span>Detector <strong>{fmtPercent(item.detector_score)}</strong></span>
-          <span>OCR <strong>{item.ocr_score == null ? 'Unavailable' : fmtPercent(item.ocr_score)}</strong></span>
+          <span title="Local OCR quality score combines recognizer confidence and plate-format validity; it is not a calibrated probability.">OCR <strong>{item.ocr_score == null ? 'Unavailable' : fmtPercent(item.ocr_score)}</strong></span>
           {item.match_score != null && <span>Frame agreement <strong>{fmtPercent(item.match_score)}</strong></span>}
         </div>
 
@@ -58,18 +58,12 @@ function ReviewItem({ item, onDecide }) {
               <div><dt>Video evidence</dt><dd>{item.video_time != null ? `${item.hits || 1} sampled read(s) · ${item.video_time}s into video` : 'Still image'}</dd></div>
             </dl>
           </div>
-          <div>
-            <small>VEHICLE APPEARANCE · GEMINI SUGGESTION</small>
-            <p>{item.suggested_color || 'Colour unavailable'} · {item.suggested_style || 'Body style unavailable'}</p>
-            <p>Derived from a frame with the plate masked. Check the original frame before using these details.</p>
-            {item.suggested_color && <button className="review-item__provider" type="button" onClick={() => setVehicleColor(item.suggested_color)}>Use suggested colour</button>}
-          </div>
           {item.alternatives?.length > 1 && (
             <div><small>ALTERNATE VIDEO READS · SELECT TO FILL</small><div className="review-item__suggestions">{item.alternatives.map((value) => <button type="button" key={value} onClick={() => setPlate(value)}>{value}</button>)}</div></div>
           )}
           <div>
             <small>INDEPENDENT PLATE READING</small>
-            <p>{item.provider ? `${item.provider_read || 'No valid reading'} · ${item.provider}` : 'Unavailable for this crop'}</p>
+            <p>{item.provider_read ? `${item.provider_read} · ${item.provider}` : item.provider === 'Gemini not configured' ? 'Gemini is not configured. Set ANPR_GEMINI_API_KEY or add the local Gemini key file.' : item.provider ? `No valid reading · ${item.provider}` : 'Unavailable for this crop'}</p>
             {item.provider_read && <button className="review-item__provider" type="button" onClick={() => setPlate(item.provider_read)}>Use second reading</button>}
           </div>
           <div>

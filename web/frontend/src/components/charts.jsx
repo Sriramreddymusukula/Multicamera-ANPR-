@@ -13,6 +13,7 @@ import {
   YAxis,
 } from 'recharts'
 import { prefersReducedMotion } from '../lib/motion'
+import { activityLevelClass } from '../lib/format'
 
 const GRID = 'rgba(148, 163, 184, 0.08)'
 const AXIS_TICK = {
@@ -23,13 +24,20 @@ const AXIS_TICK = {
 
 function ChartTip({ active, payload, label, unit = 'observations' }) {
   if (!active || !payload || !payload.length) return null
+  const point = payload[0].payload
 
   return (
     <div className="cam-tooltip">
       <strong>{label}</strong>
       <span className="cam-tooltip__meta">
-        {payload[0].value} {unit}
+        {payload[0].value} recorded {unit}
       </span>
+      {point.traffic_level && (
+        <span className={`cam-tooltip__activity ${activityLevelClass(point.traffic_level)}`}>
+          <span className="level__dot" />
+          Traffic estimate: {point.traffic_level}
+        </span>
+      )}
     </div>
   )
 }

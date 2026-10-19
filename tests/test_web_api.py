@@ -12,6 +12,7 @@ Run from the project folder:
 import os
 import sys
 import tempfile
+from datetime import datetime, timedelta
 from pathlib import Path
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -34,6 +35,11 @@ database.OUTPUT_DIR = str(Path(_TMP.name) / "output")
 
 from app import auth, services  # noqa: E402
 from app.main import app  # noqa: E402
+
+# Another test module may have imported the FastAPI app before this module
+# redirected its database paths. Reinitialize auth after applying the
+# temporary path so these tests always use their throw-away user store.
+auth.init_db()
 
 services.OUTPUT_DIR = database.OUTPUT_DIR
 
@@ -273,7 +279,9 @@ def test_public_endpoints_never_expose_plates():
 
     assert summary["active_cameras"] == 3
 
-    assert summary["multi_camera_vehicles"] == 1
+    # These fixture observations were written in the same second, so they
+    # must not be drawn as a vehicle route between distant cameras.
+    assert summary["multi_camera_vehicles"] == 0
 
 
 def test_protected_endpoints_require_login():
@@ -323,14 +331,9 @@ def test_search_and_trajectory():
 
     route = trajectory.json()
 
-    assert route["multi_camera"] is True
-
-    assert route["camera_path"] == ["CAM-01", "CAM-03"]
-
-    assert len(route["polyline"]) == 2
-
-    assert route["polyline"][0] == [17.4995, 78.4766]
-
+    assert route["multi_camera"] is False
+    assert route["camera_path"] == []
+    assert route["polyline"] == []
     assert route["summary"]["observations"] == 2
 
     missing = client.get(
@@ -365,9 +368,36 @@ def test_multi_camera_listing():
 
     vehicles = response.json()["vehicles"]
 
-    assert [row["plate"] for row in vehicles] == ["TG257602"]
+    assert vehicles == []
 
-    assert vehicles[0]["cameras"] == ["CAM-01", "CAM-03"]
+
+def test_route_only_connects_feasible_chronological_camera_sightings():
+    start = datetime(2026, 10, 19, 12, 0, 0)
+
+    def event(camera_id, parsed):
+        return {
+            "camera_id": camera_id,
+            "parsed": parsed,
+        }
+
+    simultaneous = services._plausible_route([
+        event("CAM-01", start),
+        event("CAM-03", start),
+    ])
+    assert simultaneous["camera_path"] == []
+
+    too_fast = services._plausible_route([
+        event("CAM-03", start),
+        event("CAM-01", start + timedelta(minutes=3, seconds=50)),
+    ])
+    assert too_fast["camera_path"] == []
+
+    plausible = services._plausible_route([
+        event("CAM-01", start),
+        event("CAM-03", start + timedelta(minutes=20)),
+        event("CAM-02", start + timedelta(minutes=30)),
+    ])
+    assert plausible["camera_path"] == ["CAM-01", "CAM-03", "CAM-02"]
 
 
 # ============================================================

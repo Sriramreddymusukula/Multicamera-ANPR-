@@ -6,6 +6,7 @@ import { api } from '../lib/api'
 export function Tracking() {
   const navigate = useNavigate()
   const [vehicles, setVehicles] = useState(null)
+  const [placeById, setPlaceById] = useState({})
   const [error, setError] = useState(null)
   const [loading, setLoading] = useState(true)
 
@@ -21,6 +22,11 @@ export function Tracking() {
 
   useEffect(() => {
     load()
+    api('/cameras')
+      .then((data) => setPlaceById(Object.fromEntries(
+        data.cameras.map((camera) => [camera.id, camera.location || camera.id]),
+      )))
+      .catch(() => {})
   }, [])
 
   return (
@@ -28,10 +34,10 @@ export function Tracking() {
       <div className="page-head">
         <div>
           <span className="eyebrow reveal">Operator access · cross-camera</span>
-          <h1 className="page-title reveal">Multi-Camera Tracking</h1>
+          <h1 className="page-title reveal">Vehicle Tracking</h1>
           <p className="page-sub reveal">
-            Vehicles observed at more than one camera, ranked by observation
-            count. Select a vehicle to draw its recorded route on the map.
+            Confirmed vehicle sightings and their recorded camera order. A
+            route appears when the vehicle has sightings at multiple cameras.
           </p>
         </div>
         <button
@@ -65,7 +71,7 @@ export function Tracking() {
           <div className="empty-state">
             <Path size={22} />
             <span className="empty-state__title">
-              No multi-camera vehicles recorded
+              No confirmed vehicle sightings recorded
             </span>
             <span className="empty-state__hint">
               Process the same vehicle at two different cameras from the ANPR
@@ -83,7 +89,7 @@ export function Tracking() {
               <thead>
                 <tr>
                   <th>Plate</th>
-                  <th>Observed route</th>
+                  <th>Recorded places</th>
                   <th>Cameras</th>
                   <th>Observations</th>
                   <th>Last seen</th>
@@ -108,7 +114,7 @@ export function Tracking() {
                             key={`${cameraId}-${index}`}
                             style={{ display: 'contents' }}
                           >
-                            <span className="chip chip--cyan">{cameraId}</span>
+                            <span className="chip chip--cyan">{placeById[cameraId] || cameraId}</span>
                             {index < vehicle.cameras.length - 1 && (
                               <span className="route-chips__arrow">→</span>
                             )}

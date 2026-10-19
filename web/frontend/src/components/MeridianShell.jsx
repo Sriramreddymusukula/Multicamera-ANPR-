@@ -1,6 +1,7 @@
 import { useEffect, useState } from 'react'
 import { Link } from 'react-router-dom'
 import { ArrowUpRight, List, X } from '@phosphor-icons/react'
+import { ThemeToggle } from './ThemeToggle'
 
 const links = [
   ['Home', '#home'],
@@ -57,6 +58,7 @@ export function MeridianShell({ children }) {
           <Link to="/overview" onClick={() => setOpen(false)}>Traffic Overview</Link>
           <Link className="meridian-nav__mobile-cta" to="/console" onClick={() => setOpen(false)}>Launch Console <ArrowUpRight /></Link>
         </nav>
+        <ThemeToggle className="meridian-theme-toggle" />
         <Link className="meridian-nav__cta" to="/console">Launch Console <ArrowUpRight size={17} /></Link>
         <button className="meridian-nav__toggle" type="button" aria-label={open ? 'Close menu' : 'Open menu'} aria-expanded={open} onClick={() => setOpen((value) => !value)}>{open ? <X size={22} /> : <List size={22} />}</button>
       </header>

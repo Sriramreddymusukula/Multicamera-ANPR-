@@ -184,8 +184,8 @@ export function PublicDashboard() {
                 stats={data.cameraStats}
               />
               <div className="panel__foot">
-                Markers show junction-level coordinates of the simulated
-                network. Vehicle trajectories are operator-only.
+                Signal activity is estimated from recorded observations, not
+                live congestion. Vehicle trajectories are operator-only.
               </div>
             </div>
           </div>

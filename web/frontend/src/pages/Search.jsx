@@ -11,12 +11,16 @@ import { fmtPercent } from '../lib/format'
 import { EvidenceThumb } from '../components/EvidenceThumb'
 import { CameraMap, RouteOverlay } from '../components/MapView'
 
-function RouteChips({ path }) {
+function RouteChips({ path, cameras }) {
+  const placeById = Object.fromEntries(
+    cameras.map((camera) => [camera.id, camera.location || camera.id]),
+  )
+
   return (
     <span className="route-chips">
       {path.map((cameraId, index) => (
         <span key={`${cameraId}-${index}`} style={{ display: 'contents' }}>
-          <span className="chip chip--cyan">{cameraId}</span>
+          <span className="chip chip--cyan">{placeById[cameraId] || cameraId}</span>
           {index < path.length - 1 && (
             <span className="route-chips__arrow">→</span>
           )}
@@ -186,15 +190,15 @@ export function Search() {
                 {trajectory.summary.cameras} camera(s)
               </span>
               {trajectory.multi_camera ? (
-                <span className="chip chip--accent">Multi-camera vehicle</span>
+                <span className="chip chip--accent">Recorded camera sequence</span>
               ) : (
-                <span className="chip">Single-camera observation</span>
+                <span className="chip">No route established</span>
               )}
               <span className="mono" style={{ color: 'var(--text-3)', fontSize: 12 }}>
                 {trajectory.summary.first_seen} → {trajectory.summary.last_seen}
               </span>
               {trajectory.multi_camera && (
-                <RouteChips path={trajectory.camera_path} />
+                <RouteChips path={trajectory.camera_path} cameras={cameras} />
               )}
             </div>
           </div>
@@ -221,8 +225,9 @@ export function Search() {
                   />
                 </CameraMap>
                 <div className="panel__foot">
-                  Route reconstructed from recorded ANPR observations at
-                  junction-level coordinates — not live tracking.
+                  Places are connected in recorded observation order. All
+                  saved sightings remain in the timeline; this is not live
+                  tracking.
                 </div>
               </div>
             </div>
@@ -245,7 +250,7 @@ export function Search() {
                         className={`timeline__dot${index === 0 ? ' timeline__dot--first' : ''}`}
                       />
                       <div className="timeline__head">
-                        <span className="chip chip--cyan">{event.camera_id}</span>
+                        <span className="chip chip--cyan">{event.location || event.camera_id}</span>
                         <span style={{ color: 'var(--text-2)', fontSize: 13 }}>
                           {event.location}
                         </span>

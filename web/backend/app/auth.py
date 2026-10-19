@@ -14,7 +14,6 @@ import hashlib
 import hmac
 import re
 import secrets
-import sqlite3
 import threading
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
@@ -22,6 +21,7 @@ from datetime import datetime, timedelta, timezone
 import jwt
 
 from . import settings
+from . import db as database
 
 EMAIL_PATTERN = re.compile(
     r"^[A-Za-z0-9_%+-]+(?:\.[A-Za-z0-9_%+-]+)*\.cop@"
@@ -71,12 +71,7 @@ def validate_email(email):
 
 
 def _connect():
-
-    connection = sqlite3.connect(str(settings.USERS_DB))
-
-    connection.row_factory = sqlite3.Row
-
-    return connection
+    return database.connect(settings.USERS_DB)
 
 
 @contextmanager
@@ -87,33 +82,27 @@ def _db():
 
         connection = _connect()
 
-        try:
-
-            with connection:
-
-                yield connection
-
-        finally:
-
-            connection.close()
+        with database.transaction(connection):
+            yield connection
 
 
 def init_db():
 
-    settings.USERS_DB.parent.mkdir(parents=True, exist_ok=True)
+    if not database.postgres_enabled():
+        settings.USERS_DB.parent.mkdir(parents=True, exist_ok=True)
 
     with _db() as connection:
 
         connection.execute(
             """
             CREATE TABLE IF NOT EXISTS users (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                id {id_type},
                 email TEXT NOT NULL UNIQUE,
                 password_hash TEXT NOT NULL,
                 salt TEXT NOT NULL,
                 created_at TEXT NOT NULL
             )
-            """
+            """.format(id_type="BIGSERIAL PRIMARY KEY" if database.is_postgres(connection) else "INTEGER PRIMARY KEY AUTOINCREMENT")
         )
 
 

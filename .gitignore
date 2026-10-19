@@ -10,6 +10,9 @@ web/backend/.gemini-key
 web/backend/web_users.db
 web/backend/reviews.db
 web/backend/.uploads/
+web/backend/.env
+web/backend/.env.*
+!web/backend/.env.example
 web/frontend/node_modules/
 web/frontend/dist/
 web/frontend/.vite/

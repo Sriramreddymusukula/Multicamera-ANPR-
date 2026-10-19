@@ -4,6 +4,7 @@ import {
   Camera,
   CheckCircle,
   Image,
+  Trash,
   UploadSimple,
   VideoCamera,
   WarningCircle,
@@ -29,7 +30,7 @@ function DetectionTable({ detections }) {
       <thead>
         <tr>
           <th>Plate</th>
-          <th title="Tesseract text confidence, separate from detector score">OCR score</th>
+          <th title="Local OCR quality score combines recognizer confidence and plate-format validity; it is not a calibrated probability">OCR score</th>
           <th>Review</th>
           <th title="YOLO plate-region detection score; verify OCR text against evidence">Detector score</th>
           <th>Camera</th>
@@ -48,7 +49,13 @@ function DetectionTable({ detections }) {
               {detection.review_status === 'pending'
                 ? <Link className="chip chip--review" to="/reviews">Needs review</Link>
                 : <span className="chip">Accepted</span>}
-              {detection.provider_read && <small className="console-workspace__provider">Second read: {detection.provider_read}</small>}
+              {detection.provider && (
+                <small className="console-workspace__provider">
+                  {detection.provider.startsWith('Skipped:')
+                    ? detection.provider
+                    : `${detection.provider.startsWith('Gemini') ? 'Gemini' : detection.provider}: ${detection.provider_read || 'no valid plate read'}`}
+                </small>
+              )}
             </td>
             <td>
               <span className="confidence">
@@ -99,6 +106,10 @@ export function Console() {
   const [error, setError] = useState(null)
   const [result, setResult] = useState(null)
   const [job, setJob] = useState(null)
+  const [clearConfirmation, setClearConfirmation] = useState('')
+  const [clearStatus, setClearStatus] = useState(null)
+  const [clearing, setClearing] = useState(false)
+  const [showClearConfirmation, setShowClearConfirmation] = useState(false)
   const fileInput = useRef(null)
 
   useEffect(() => {
@@ -221,6 +232,33 @@ export function Console() {
     }
   }
 
+  const clearAllRecords = async () => {
+    setClearing(true)
+    setClearStatus(null)
+    try {
+      const data = await api('/data', {
+        method: 'DELETE',
+        auth: true,
+        body: { confirmation: clearConfirmation },
+      })
+      setResult(null)
+      setJob(null)
+      setFiles([])
+      setClearStatus({
+        type: data.evidence_cleanup_complete ? 'success' : 'error',
+        message: data.evidence_cleanup_complete
+          ? `Deleted ${data.detections_deleted} observation(s) and ${data.reviews_deleted} review(s). User accounts were kept.`
+          : `Deleted ${data.detections_deleted} observation(s) and ${data.reviews_deleted} review(s), but some evidence files could not be removed. User accounts were kept.`,
+      })
+      setClearConfirmation('')
+      setShowClearConfirmation(false)
+    } catch (err) {
+      setClearStatus({ type: 'error', message: err.message })
+    } finally {
+      setClearing(false)
+    }
+  }
+
   const activeMode = MODES.find((entry) => entry.id === mode)
   const progress = job?.progress
   const progressPercent = progress?.percent ?? 0
@@ -311,7 +349,7 @@ export function Console() {
               <span className="dropzone__hint">
                 {mode === 'image'
                   ? 'JPG · PNG · BMP — up to 10 images, 25 MB each'
-                  : 'MP4 · AVI · MKV · MOV — up to 300 MB, sampled at 3 fps'}
+                  : 'MP4 · AVI · MKV · MOV — up to 300 MB, sampled at 3 fps by default'}
               </span>
               {files.length > 0 && (
                 <span className="dropzone__file">
@@ -438,6 +476,69 @@ export function Console() {
           </div>
         </div>
       </div>
+
+      <section className="panel console-workspace__clear" aria-labelledby="clear-data-title">
+        <div className="panel__head">
+          <h2 className="panel__title" id="clear-data-title">Clear ANPR records</h2>
+          <span className="panel__meta">USER ACCOUNTS ARE KEPT</span>
+        </div>
+        <p className="console-workspace__clear-copy">
+          Permanently remove all recorded observations, review history, and their associated evidence files.
+          Operator accounts will remain available.
+        </p>
+        {clearStatus && (
+          <div className={`alert ${clearStatus.type === 'success' ? 'alert--success' : 'alert--error'}`} role="status">
+            <WarningCircle size={17} style={{ flex: 'none' }} />
+            <span>{clearStatus.message}</span>
+          </div>
+        )}
+        {!showClearConfirmation ? (
+          <button
+            type="button"
+            className="btn btn--danger"
+            onClick={() => {
+              setClearStatus(null)
+              setShowClearConfirmation(true)
+            }}
+          >
+            <Trash size={15} />
+            Clear all records
+          </button>
+        ) : (
+          <div className="console-workspace__clear-confirm">
+            <label className="field__label" htmlFor="clear-data-confirmation">
+              Type CLEAR ALL DATA to confirm
+            </label>
+            <input
+              id="clear-data-confirmation"
+              className="input"
+              value={clearConfirmation}
+              onChange={(event) => setClearConfirmation(event.target.value)}
+              autoComplete="off"
+            />
+            <button
+              type="button"
+              className="btn btn--danger"
+              onClick={clearAllRecords}
+              disabled={clearing || clearConfirmation !== 'CLEAR ALL DATA'}
+            >
+              <Trash size={15} />
+              {clearing ? 'Clearing records…' : 'Confirm and clear'}
+            </button>
+            <button
+              type="button"
+              className="btn btn--ghost"
+              onClick={() => {
+                setShowClearConfirmation(false)
+                setClearConfirmation('')
+              }}
+              disabled={clearing}
+            >
+              Cancel
+            </button>
+          </div>
+        )}
+      </section>
     </div>
   )
 }

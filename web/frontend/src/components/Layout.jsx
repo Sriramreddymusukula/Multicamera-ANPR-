@@ -13,7 +13,9 @@ import { useReveal } from '../lib/motion'
 import { enableReviewSound } from '../lib/reviewSound'
 import { Ticker } from './Ticker'
 import { MeridianShell } from './MeridianShell'
+import { ThemeToggle } from './ThemeToggle'
 import '../styles/workspace.css'
+import '../styles/theme.css'
 
 const NAV = [
   { to: '/', label: 'Meridian', end: true },
@@ -140,6 +142,7 @@ export function Layout() {
         </nav>
 
         <div className="topbar__actions">
+          <ThemeToggle />
           {isAuthed ? (
             <>
               <span className="operator-chip" title={email || ''}>

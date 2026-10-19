@@ -1,6 +1,7 @@
 import { lazy, Suspense } from 'react'
 import { BrowserRouter, Navigate, Route, Routes } from 'react-router-dom'
 import { AuthProvider, RequireAuth } from './lib/auth'
+import { ThemeProvider } from './lib/theme'
 import { Layout } from './components/Layout'
 import { RouteCurtain } from './components/RouteCurtain'
 
@@ -43,8 +44,9 @@ function RouteFallback() {
 
 export default function App() {
   return (
-    <AuthProvider>
-      <BrowserRouter>
+    <ThemeProvider>
+      <AuthProvider>
+        <BrowserRouter>
         <Routes>
           <Route element={<Layout />}>
             <Route
@@ -114,7 +116,8 @@ export default function App() {
           </Route>
         </Routes>
         <RouteCurtain />
-      </BrowserRouter>
-    </AuthProvider>
+        </BrowserRouter>
+      </AuthProvider>
+    </ThemeProvider>
   )
 }

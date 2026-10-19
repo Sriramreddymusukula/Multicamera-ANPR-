@@ -18,7 +18,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 
-from . import auth, review, settings
+from . import auth, db, review, settings
 from .routes_auth import router as auth_router
 from .routes_ops import router as ops_router
 from .routes_public import router as public_router
@@ -45,6 +45,12 @@ def create_app():
 
     auth.init_db()
     review.init_db()
+    connection = db.connect(settings.REVIEW_DB)
+    try:
+        with connection:
+            db.ensure_detection_schema(connection)
+    finally:
+        connection.close()
 
     app.include_router(public_router)
     app.include_router(auth_router)

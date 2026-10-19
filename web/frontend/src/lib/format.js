@@ -25,6 +25,7 @@ export function activityLevelClass(level) {
     case 'LOW':
       return 'level level--low'
     case 'MODERATE':
+    case 'MEDIUM':
       return 'level level--moderate'
     case 'HIGH':
       return 'level level--high'

@@ -8,9 +8,15 @@ import os
 import secrets
 from pathlib import Path
 
+from dotenv import load_dotenv
+
 WEB_DIR = Path(__file__).resolve().parents[1]
 PROJECT_ROOT = WEB_DIR.parents[1]
 FRONTEND_DIST = WEB_DIR.parent / "frontend" / "dist"
+
+# Local secrets live in web/backend/.env (ignored by Git). Real environment
+# variables, such as Render's service settings, take precedence.
+load_dotenv(WEB_DIR / ".env", override=False)
 
 USERS_DB = WEB_DIR / "web_users.db"
 REVIEW_DB = WEB_DIR / "reviews.db"
@@ -71,6 +77,18 @@ def get_gemini_key():
         return GEMINI_KEY_FILE.read_text(encoding="utf-8").strip()
     except OSError:
         return ""
+
+
+def get_supabase_url():
+    return os.environ.get("SUPABASE_URL", "").strip().rstrip("/")
+
+
+def get_supabase_service_key():
+    return os.environ.get("SUPABASE_SERVICE_ROLE_KEY", "").strip()
+
+
+def get_evidence_bucket():
+    return os.environ.get("ANPR_EVIDENCE_BUCKET", "anpr-evidence").strip()
 
 
 def ensure_upload_dir():

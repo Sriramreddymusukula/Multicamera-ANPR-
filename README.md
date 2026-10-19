@@ -4,7 +4,7 @@
 
 A Python-based **AI-powered Automatic Number Plate Recognition (ANPR)** prototype designed to demonstrate how vehicle observations from multiple camera locations can be combined to build a city-wide traffic intelligence system.
 
-The system uses **YOLOv8** for license plate detection and **Tesseract OCR** for recognizing vehicle registration numbers. Detected vehicles can then be associated across simulated camera locations to reconstruct observed routes and generate session-based traffic analytics.
+The system uses **YOLOv8** for license plate detection and **RapidOCR (PP-OCRv6 via ONNX Runtime)** as its local plate-text reader, with Tesseract as a fallback. Detected vehicles can then be associated across simulated camera locations to reconstruct observed routes and generate session-based traffic analytics.
 
 > **Current Status:** Prototype
 > **Input:** Uploaded vehicle images
@@ -30,7 +30,7 @@ License Plate Cropping
       ↓
 Image Preprocessing
       ↓
-Tesseract OCR
+RapidOCR (PP-OCRv6), with Tesseract fallback
       ↓
 Vehicle Registration Number
       ↓
@@ -57,7 +57,7 @@ The system performs an end-to-end ANPR pipeline:
 * Extracts the detected plate region
 * Crops the license plate
 * Preprocesses the cropped image
-* Uses **Tesseract OCR** to recognize the plate number
+* Uses **RapidOCR (PP-OCRv6)** to recognize the plate number, with Tesseract as a local fallback
 * Cleans the OCR output into an alphanumeric vehicle identifier
 * Supports multiple detected plates within an image
 
@@ -164,8 +164,8 @@ The desktop GUI provides:
 | **Python**               | Core programming language                |
 | **YOLOv8 / Ultralytics** | License plate detection                  |
 | **OpenCV**               | Image processing and preprocessing       |
-| **Tesseract OCR**        | License plate text recognition           |
-| **Pytesseract**          | Python interface for Tesseract           |
+| **RapidOCR / ONNX Runtime** | Local plate text recognition           |
+| **Tesseract / Pytesseract** | Fallback local text recognition        |
 | **CustomTkinter**        | Desktop graphical interface              |
 | **Pillow**               | Image loading and preview                |
 | **Pandas**               | Detection and history data handling      |
@@ -198,7 +198,7 @@ The desktop GUI provides:
                                │
                                ▼
                     ┌──────────────────────┐
-                    │    Tesseract OCR     │
+                    │ RapidOCR / fallback │
                     └──────────┬───────────┘
                                │
                                ▼
@@ -351,7 +351,11 @@ Verify:
 
 ---
 
-# 🔤 Install Tesseract OCR
+# 🔤 Local OCR engines
+
+RapidOCR downloads its ONNX model files the first time it runs. It then runs locally without a Gemini key. Tesseract remains a fallback when RapidOCR cannot initialize or cannot read a structurally valid plate. Set `ANPR_OCR_ENGINE=tesseract` before starting the app to use the previous Tesseract-only reader.
+
+## Install Tesseract fallback
 
 Tesseract is a separate application and must be installed independently from the Python package.
 
@@ -511,7 +515,7 @@ Improved OCR Input
 
 ---
 
-## Tesseract OCR — Recognition
+## Tesseract fallback — Recognition
 
 Tesseract reads the processed license plate image and converts the visual characters into text.
 
@@ -821,7 +825,7 @@ This architecture provides a foundation that can eventually evolve from a deskto
 
 Built with:
 
-**Python • YOLOv8 • OpenCV • Tesseract OCR • CustomTkinter • Pandas**
+**Python • YOLOv8 • RapidOCR • ONNX Runtime • Tesseract fallback • CustomTkinter • Pandas**
 
 ---
 

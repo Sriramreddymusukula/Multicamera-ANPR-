@@ -1,3 +1,5 @@
 @echo off
 cd /d "%~dp0"
-"%~dp0venv\Scripts\python.exe" gui.py
+set "PYTHON=%~dp0venv\Scripts\python.exe"
+if not exist "%PYTHON%" set "PYTHON=python"
+"%PYTHON%" gui.py

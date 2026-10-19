@@ -19,10 +19,11 @@ from fastapi import (
     UploadFile,
 )
 from fastapi.responses import FileResponse
+from fastapi.responses import Response
 
 from processing import process_images
 
-from . import review, services, settings
+from . import review, services, settings, storage
 from .deps import require_user, save_upload
 from .jobs import job_store
 
@@ -98,6 +99,23 @@ class ReviewDecision(BaseModel):
     action: str
     plate: str = ""
     vehicle_color: str | None = None
+
+
+class ClearDataRequest(BaseModel):
+    confirmation: str
+
+
+@router.delete("/data")
+def clear_operational_data(
+    payload: ClearDataRequest,
+    operator: str = Depends(require_user),
+):
+    if payload.confirmation != "CLEAR ALL DATA":
+        raise HTTPException(
+            status_code=400,
+            detail="Type CLEAR ALL DATA to confirm this action.",
+        )
+    return services.clear_operational_data()
 
 
 @router.get("/reviews")
@@ -207,6 +225,12 @@ def evidence(
     filename: str,
     operator: str = Depends(require_user)
 ):
+
+    if storage.configured():
+        stored = storage.read_object(filename)
+        if stored is not None:
+            content, content_type = stored
+            return Response(content=content, media_type=content_type)
 
     path = services.evidence_path(filename)
 

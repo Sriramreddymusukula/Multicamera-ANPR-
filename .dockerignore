@@ -1,0 +1,37 @@
+.git
+.github
+.pytest_cache
+__pycache__
+**/__pycache__
+*.py[cod]
+
+# Secrets and local runtime state must be provided through Render environment variables.
+.env
+.env.*
+**/.env
+**/.env.*
+!.env.example
+**/.secret
+**/.gemini-key
+**/gemini.key
+**/*.db
+**/*.sqlite
+**/*.sqlite3
+
+# Local-only evidence, generated output, and frontend dependencies/build artifacts.
+web/backend/.uploads
+output
+dogfood-output
+web/frontend/node_modules
+web/frontend/dist
+web/frontend/.vite
+venv
+.venv
+
+# Local data exports and development artifacts; keep models/best.pt in the image.
+vehicle_database.csv
+tests
+Screenshot*.png
+WhatsApp*.jpg
+WhatsApp*.jpeg
+WhatsApp*.png
